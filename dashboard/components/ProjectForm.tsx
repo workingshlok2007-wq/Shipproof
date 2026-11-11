@@ -25,6 +25,13 @@ export function parseUrls(raw: string): string[] {
   });
 }
 
+export function parseEmailQuery(raw: string): string | null {
+  const query = raw.trim();
+  if (!query) return null;
+  if (/^https?:\/\//i.test(query)) throw new Error("Gmail search must be a Gmail query such as from:organisers@event.dev, not a URL");
+  return query;
+}
+
 export function ProjectForm({ client, onCreated }: { client: ApiClient; onCreated: (project: Project) => void }) {
   const [projectId, setProjectId] = useState("");
   const [repo, setRepo] = useState("");
@@ -38,7 +45,7 @@ export function ProjectForm({ client, onCreated }: { client: ApiClient; onCreate
     event.preventDefault();
     const created = await run(() => client.createProject({
       projectId, repo: repo.trim(), proposalText, links: parseLinks(links), rulePages: parseUrls(rulePages),
-      emailQuery: emailQuery.trim() || null,
+      emailQuery: parseEmailQuery(emailQuery),
     }));
     if (created) onCreated(created);
   };
@@ -54,13 +61,13 @@ export function ProjectForm({ client, onCreated }: { client: ApiClient; onCreate
           </Field>
         </div>
         <Field label="Submission links" hint="One per line: Demo video | https://...">
-          <textarea className="field min-h-20 font-mono" value={links} onChange={(e) => setLinks(e.target.value)} />
+          <textarea className="field min-h-20 font-mono" placeholder="Demo video | https://youtu.be/..." value={links} onChange={(e) => setLinks(e.target.value)} />
         </Field>
         <Field label="Rules pages" hint="One URL per line.">
-          <textarea className="field min-h-20 font-mono" value={rulePages} onChange={(e) => setRulePages(e.target.value)} />
+          <textarea className="field min-h-20 font-mono" placeholder="https://event.dev/rules" value={rulePages} onChange={(e) => setRulePages(e.target.value)} />
         </Field>
-        <Field label="Gmail search (optional)" hint="e.g. from:organisers@event.dev newer_than:30d">
-          <input className="field" maxLength={500} value={emailQuery} onChange={(e) => setEmailQuery(e.target.value)} />
+        <Field label="Gmail search (optional)" hint="A Gmail query, not a URL. Needs Gmail authorised on the engine.">
+          <input className="field" maxLength={500} placeholder="from:organisers@event.dev newer_than:30d" value={emailQuery} onChange={(e) => setEmailQuery(e.target.value)} />
         </Field>
         <div className="flex items-end"><Button type="submit" variant="primary" disabled={busy}>Create project</Button></div>
         <div className="md:col-span-2"><ErrorNote message={error} /></div>

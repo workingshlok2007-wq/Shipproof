@@ -67,7 +67,10 @@ async function request<T>(token: string, path: string, method: "GET" | "POST" = 
     try {
       payload = JSON.parse(text);
     } catch {
-      throw new ApiError(response.status, `engine returned non-JSON (${response.status})`);
+      // The Next.js proxy answers with a plain-text 500 when nothing is listening at SHIPPROOF_API_URL.
+      throw new ApiError(response.status, response.status >= 500
+        ? "Engine unreachable. Start it in another terminal: uvicorn shipproof.api:buildApp --factory --host 127.0.0.1 --port 8000"
+        : `engine returned non-JSON (${response.status})`);
     }
   }
   if (!response.ok) {
