@@ -18,6 +18,7 @@ The engine is an API-first LangGraph agent (`shipproof/agent/graph.py`):
 | Gate | A confusion index is computed from structural signals only (conflicts, undated rules, unreachable sources, failed renders, suspected prompt injection). Above the threshold the agent halts and asks. |
 | Plan | Builds the task list: repository audit, link audits, scope alignment, interpretation checks. |
 | Audit | GitHub visibility as an anonymous user, README, license, commits; headless link checks for login walls and soft 404s; alignment score computed from code evidence, not from README prose. |
+| Remediate | Drafts fixes for minor problems from verified facts: LICENSE (you pick the type), a README that states only what the code proves, marked broken README links, and advice for promised features with no code. One click opens a pull request on a new branch; the agent never merges. |
 | Finalize | Ends at `PENDING_HUMAN_APPROVAL`. Approval requires an authenticated human, a human-confirmed Coverage Ledger, no STALE checks and no CRITICAL flags. |
 
 ### Trust tiers
@@ -68,7 +69,7 @@ npm run build && npm start        # or: npm run dev
 
 Open http://localhost:3000 and paste the contents of `.shipproof-token`. The dashboard proxies `/api/*` to the engine (`SHIPPROOF_API_URL`, default `http://127.0.0.1:8000`), so only port 3000 needs to be reachable from the browser.
 
-Optional environment: `GITHUB_TOKEN` (5000 instead of 60 GitHub requests per hour), `GMAIL_CLIENT_SECRETS` and `GMAIL_TOKEN_FILE` (authorise once with `python -m shipproof.tools.gmailIngest`), `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS`, `SHIPPROOF_CONFUSION_THRESHOLD` (default 15), `SHIPPROOF_DATA_FILE`.
+Optional environment: `GITHUB_TOKEN` (5000 instead of 60 GitHub requests per hour), `GITHUB_WRITE_TOKEN` (needed only to apply suggested fixes: a fine-grained token for the one repository with Contents and Pull requests set to read/write; it can only write `README.md` and `LICENSE` on a new branch), `GMAIL_CLIENT_SECRETS` and `GMAIL_TOKEN_FILE` (authorise once with `python -m shipproof.tools.gmailIngest`), `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS`, `SHIPPROOF_CONFUSION_THRESHOLD` (default 15), `SHIPPROOF_DATA_FILE`.
 
 ## Known limits
 

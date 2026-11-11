@@ -25,6 +25,9 @@ from pydantic import BaseModel, Field, ValidationError
 from shipproof.agent.graph import AuditDependencies, runAudit
 from shipproof.agent.project import LinkTarget, Project
 from shipproof.agent.store import ConflictError, EventBus, NotFoundError, ProjectStore, StoreError
+from shipproof.remediation import FileChange, RemediationKind, RemediationStatus, fillLicenseTemplate
+from shipproof.tools.githubAudit import GitHubError
+from shipproof.tools.githubWrite import GitHubWriter
 from shipproof.llm import GeminiClient, GeminiConfig, LlmClient, LlmConfigError
 from shipproof.models import (
     Actor,
@@ -51,6 +54,7 @@ OWNER = Actor(actorId="owner", kind=ActorKind.HUMAN, role=Role.OWNER)
 
 ToolboxFactory = Callable[[], ContextManager[dict[str, BaseTool]]]
 LlmFactory = Callable[[], tuple[Optional[LlmClient], Optional[str]]]
+WriterFactory = Callable[[], GitHubWriter]
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,14 @@ def defaultToolbox() -> Iterator[dict[str, BaseTool]]:
             yield {tool.name: tool for tool in buildTools(github, auditor, gmailService)}
     finally:
         github.close()
+
+
+def defaultWriter() -> GitHubWriter:
+    token = os.environ.get("GITHUB_WRITE_TOKEN", "")
+    if not token:
+        raise GitHubError("GITHUB_WRITE_TOKEN is not set on the engine; applying fixes needs a token with Contents and "
+                          "Pull requests write access to this repository")
+    return GitHubWriter(token)
 
 
 def defaultLlm() -> tuple[Optional[LlmClient], Optional[str]]:
@@ -152,7 +164,13 @@ def _validationDetail(error: ValidationError) -> list[dict[str, Any]]:
     return [{"loc": [str(p) for p in e["loc"]], "msg": e["msg"]} for e in error.errors(include_url=False)]
 
 
-def createApp(settings: Settings, toolboxFactory: ToolboxFactory = defaultToolbox, llmFactory: LlmFactory = defaultLlm) -> FastAPI:
+class ApplyBody(BaseModel):
+    licenseKey: Optional[str] = None
+    copyrightHolder: Optional[str] = Field(None, max_length=100)
+
+
+def createApp(settings: Settings, toolboxFactory: ToolboxFactory = defaultToolbox, llmFactory: LlmFactory = defaultLlm,
+              writerFactory: WriterFactory = defaultWriter) -> FastAPI:
     store = ProjectStore(settings.dataFile)
     bus = EventBus()
     app = FastAPI(title="ShipProof", version="0.4.0")
@@ -325,6 +343,43 @@ def createApp(settings: Settings, toolboxFactory: ToolboxFactory = defaultToolbo
         packet = store.updatePacket(packetId, lambda p: transitionPacket(p, ApprovalState.REJECTED, actor))
         bus.publish(packetId, "decision", {"approvalState": packet.approvalState.value})
         return packet.model_dump(mode="json")
+
+    @app.post("/packets/{packetId}/remediations/{remediationId}/apply")
+    def applyRemediation(packetId: str, remediationId: str, body: ApplyBody, _: Actor = Depends(requireHuman)) -> dict[str, Any]:
+        """Human-triggered: opens a pull request on a new branch. The agent never merges."""
+        remediation = store.getRemediation(packetId, remediationId)
+        if not remediation.applicable:
+            raise ConflictError("this remediation is advice only and cannot be applied automatically")
+        project = store.getProject(store.getSummary(packetId).projectId)  # type: ignore[union-attr]
+        store.beginApply(packetId, remediationId)
+        try:
+            writer = writerFactory()
+            try:
+                changes = remediation.changes
+                if remediation.kind is RemediationKind.ADD_LICENSE:
+                    if not body.licenseKey or not body.copyrightHolder:
+                        raise ConflictError("choose a license and a copyright holder")
+                    template = writer.licenseTemplate(body.licenseKey)
+                    changes = (FileChange(path="LICENSE", newContent=fillLicenseTemplate(template, utcNow().year, body.copyrightHolder)),)
+                prBody = "\n\n".join((remediation.rationale, *remediation.advice,
+                                        f"Drafted by ShipProof from audit `{packetId}` ({remediation.draftedFrom}). Review before merging."))
+                url = writer.openPullRequest(project.repo, remediationId, remediation.title, prBody, changes)
+            finally:
+                writer.close()
+        except GitHubError as error:
+            store.releaseApply(packetId, remediationId)
+            raise HTTPException(502, str(error)) from error
+        except BaseException:
+            store.releaseApply(packetId, remediationId)
+            raise
+        applied = store.finishRemediation(packetId, remediationId, RemediationStatus.APPLIED, url)
+        bus.publish(packetId, "remediationApplied", {"remediationId": remediationId, "pullRequestUrl": url})
+        return applied.model_dump(mode="json")
+
+    @app.post("/packets/{packetId}/remediations/{remediationId}/dismiss")
+    def dismissRemediation(packetId: str, remediationId: str, _: Actor = Depends(requireHuman)) -> dict[str, Any]:
+        store.beginApply(packetId, remediationId)
+        return store.finishRemediation(packetId, remediationId, RemediationStatus.DISMISSED).model_dump(mode="json")
 
     @app.websocket("/ws/packets/{packetId}")
     async def packetEvents(websocket: WebSocket, packetId: str) -> None:

@@ -108,6 +108,14 @@ class GitHubClient:
         self._raiseIfRateLimited(response)
         return response
 
+    def send(self, method: str, path: str, body: Optional[dict] = None) -> httpx.Response:
+        try:
+            response = self._http.request(method, path, headers=self._headers(True, "application/vnd.github+json"), json=body)
+        except httpx.HTTPError as error:
+            raise GitHubError(f"GitHub {method} failed: {type(error).__name__}: {error}") from error
+        self._raiseIfRateLimited(response)
+        return response
+
     def downloadTarball(self, path: str) -> bytes:
         chunks: list[bytes] = []
         size = 0

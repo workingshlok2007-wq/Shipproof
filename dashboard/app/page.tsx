@@ -181,7 +181,11 @@ export default function Home() {
 
           {view ? (
             <AuditView client={client} view={view} events={stream.events} streamMode={stream.mode} streamError={stream.error}
-                       onPacket={(packet) => setView({ packet, summary: view.summary })} />
+                       onPacket={(packet) => setView({ packet, summary: view.summary })}
+                       onRemediation={(updated) => setView({ ...view, summary: view.summary && {
+                         ...view.summary,
+                         remediations: view.summary.remediations.map((r) => r.remediationId === updated.remediationId ? updated : r),
+                       } })} />
           ) : packetId ? <Empty>Loading audit…</Empty> : <Empty>No audits yet. Add Charter clauses and interpretations, then run an audit.</Empty>}
         </>
       )}

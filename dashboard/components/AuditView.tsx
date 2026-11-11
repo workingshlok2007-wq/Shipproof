@@ -2,12 +2,13 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { ApiClient } from "@/lib/api";
-import type { AuditEvent, PacketView, Severity, SubmissionPacket } from "@/lib/types";
+import type { AuditEvent, PacketView, Remediation, Severity, SubmissionPacket } from "@/lib/types";
 import type { StreamMode } from "@/lib/useAuditStream";
 import { Button, Card, Empty, ErrorNote, SafeLink, SeverityBadge, StatusBadge, formatTime } from "./ui";
+import { RemediationPanel } from "./RemediationPanel";
 import { useAction } from "./useAction";
 
-const STAGES = ["queued", "ingest", "extract", "reconcile", "plan", "audit", "finalize"] as const;
+const STAGES = ["queued", "ingest", "extract", "reconcile", "plan", "audit", "remediate", "finalize"] as const;
 const SEVERITY_ORDER: Record<Severity, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
 
 function StageTimeline({ events, finished, halted }: { events: AuditEvent[]; finished: boolean; halted: boolean }) {
@@ -16,7 +17,7 @@ function StageTimeline({ events, finished, halted }: { events: AuditEvent[]; fin
   return (
     <ol className="flex flex-wrap items-center gap-2" aria-label="Audit stages">
       {STAGES.map((stage) => {
-        const skipped = halted && (stage === "plan" || stage === "audit");
+        const skipped = halted && (stage === "plan" || stage === "audit" || stage === "remediate");
         const done = (reached.has(stage) && (stage !== current || finished)) || (finished && !skipped && reached.has(stage));
         const active = stage === current && !finished;
         return (
@@ -61,9 +62,9 @@ function approvalBlockers(packet: SubmissionPacket): string[] {
   return blockers;
 }
 
-export function AuditView({ client, view, events, streamMode, streamError, onPacket }: {
+export function AuditView({ client, view, events, streamMode, streamError, onPacket, onRemediation }: {
   client: ApiClient; view: PacketView; events: AuditEvent[]; streamMode: StreamMode; streamError: string | null;
-  onPacket: (packet: SubmissionPacket) => void;
+  onPacket: (packet: SubmissionPacket) => void; onRemediation: (remediation: Remediation) => void;
 }) {
   const { packet, summary } = view;
   const { busy, error, run } = useAction();
@@ -191,6 +192,9 @@ export function AuditView({ client, view, events, streamMode, streamError, onPac
           <p className="mt-3 text-[11px] text-muted">Not covered automatically: Discord, mentor comments, login-gated pages, emails to other addresses.</p>
         </Card>
       </div>
+
+      <RemediationPanel client={client} packetId={packet.packetId} remediations={summary?.remediations ?? []} auditing={auditing}
+                        onUpdated={onRemediation} />
 
       {summary && summary.rules.length > 0 && (
         <Card title="Extracted rules" subtitle="Each rule quotes its source verbatim; unquotable rules were dropped.">

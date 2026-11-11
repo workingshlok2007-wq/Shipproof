@@ -51,10 +51,18 @@ export interface GroundedRule {
   sourceId: string; ruleText: string; category: string; verbatimQuote: string; issuedAt: string | null;
   deadlineAt: string | null; dateAmbiguous: boolean; supersedesEarlierRule: boolean;
 }
+export type RemediationKind = "ADD_LICENSE" | "IMPROVE_README" | "FIX_README_LINKS" | "MISSING_FEATURE_GUIDANCE";
+export type RemediationStatus = "PROPOSED" | "APPLIED" | "DISMISSED";
+export interface Remediation {
+  remediationId: string; kind: RemediationKind; title: string; rationale: string;
+  changes: { path: string; newContent: string }[]; advice: string[]; requiredInputs: string[]; applicable: boolean;
+  status: RemediationStatus; pullRequestUrl: string | null; draftedFrom: string;
+}
+
 export interface AuditSummary {
   packetId: string; projectId: string; startedAt: string; finishedAt: string | null; plan: PlannedTask[];
   rules: GroundedRule[]; effectiveDeadline: string | null; confusionIndex: number; confusionThreshold: number;
-  halted: boolean; error: string | null;
+  halted: boolean; error: string | null; remediations: Remediation[];
 }
 export interface PacketView { packet: SubmissionPacket; summary: AuditSummary | null }
 

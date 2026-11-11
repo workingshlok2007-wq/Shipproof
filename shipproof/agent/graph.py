@@ -39,7 +39,15 @@ from shipproof.models import (
     transitionPacket,
     utcNow,
 )
-from shipproof.prompts import GroundedRule, assessAlignment, checkInterpretation, extractRules
+from shipproof.prompts import FeatureAssessment, GroundedRule, assessAlignment, checkInterpretation, extractRules
+from shipproof.remediation import (
+    Remediation,
+    extractReadmeLinks,
+    featureGuidance,
+    licenseRemediation,
+    readmeLinksRemediation,
+    readmeRemediation,
+)
 from shipproof.tools.agentTools import makeSourceId, unreachableSource
 from shipproof.tools.githubAudit import RepoAudit
 
@@ -69,6 +77,9 @@ class AuditState(TypedDict, total=False):
     plan: list[PlannedTask]
     repoAudit: Optional[RepoAudit]
     effectiveDeadline: Optional[datetime]
+    features: list[FeatureAssessment]
+    alignmentAvailable: bool
+    remediations: list[Remediation]
     confusionIndex: int
     halted: bool
 
@@ -193,6 +204,8 @@ def buildAuditGraph(deps: AuditDependencies) -> Any:
         reports: list[AlignmentReport] = []
         proofChecks = list(project.proofChecks)
         repoAudit: Optional[RepoAudit] = None
+        features: list[FeatureAssessment] = []
+        alignmentAvailable = False
 
         try:
             repoAudit = RepoAudit.model_validate(deps.tools["auditRepository"].invoke({"repo": project.repo}))
@@ -234,6 +247,8 @@ def buildAuditGraph(deps: AuditDependencies) -> Any:
                 try:
                     alignment = assessAlignment(deps.llm, project.proposalText, repoAudit.readmeText or "",
                                                 repoAudit.commitMessages, repoAudit.codeIndex)
+                    features = list(alignment.features)
+                    alignmentAvailable = True
                     if alignment.report is not None:
                         reports.append(alignment.report)
                         emit("alignment", alignment.report.model_dump(mode="json"))
@@ -255,7 +270,38 @@ def buildAuditGraph(deps: AuditDependencies) -> Any:
                 proofChecks[position] = check.model_copy(update={"status": result.status})
                 emit("proofCheck", {"checkId": check.checkId, "status": result.status.value, "label": result.label})
         return {"evidence": evidence, "sources": sources, "reports": reports, "proofChecks": proofChecks,
-                "repoAudit": repoAudit, "flags": _addFlags(state, specs, emit)}
+                "repoAudit": repoAudit, "features": features, "alignmentAvailable": alignmentAvailable,
+                "flags": _addFlags(state, specs, emit)}
+
+    def remediate(state: AuditState) -> AuditState:
+        """Drafts fixes for minor problems. Drafting only: nothing is written until a human applies a fix."""
+        emit("stage", {"stage": "remediate"})
+        repoAudit = state.get("repoAudit")
+        evidence = list(state["evidence"])
+        drafts: list[Remediation] = []
+        if repoAudit is None:
+            return {"remediations": drafts}
+        features = tuple(state.get("features", []))
+        if repoAudit.licenseStatus is CheckStatus.FAIL:
+            drafts.append(licenseRemediation())
+        if repoAudit.codeIndex is not None and repoAudit.readmeStatus is CheckStatus.FAIL:
+            drafts.append(readmeRemediation(repoAudit.repo, repoAudit.codeIndex, features, state.get("alignmentAvailable", False)))
+        elif repoAudit.readmeText:
+            linkEvidence = [EvidenceItem.model_validate(deps.tools["auditLink"].invoke({"url": url, "evidenceId": f"readmeLink{n}"}))
+                            for n, url in enumerate(extractReadmeLinks(repoAudit.readmeText), start=1)]
+            evidence += linkEvidence
+            if linkEvidence:
+                emit("evidence", {"items": [e.model_dump(mode="json") for e in linkEvidence]})
+            linkFix = readmeLinksRemediation(repoAudit.readmeText, linkEvidence)
+            if linkFix is not None:
+                drafts.append(linkFix)
+        if repoAudit.codeIndex is not None:
+            guidance = featureGuidance(features, repoAudit.codeIndex)
+            if guidance is not None:
+                drafts.append(guidance)
+        for draft in drafts:
+            emit("remediation", {"remediationId": draft.remediationId, "title": draft.title})
+        return {"remediations": drafts, "evidence": evidence}
 
     def finalize(state: AuditState) -> AuditState:
         emit("stage", {"stage": "finalize"})
@@ -275,14 +321,15 @@ def buildAuditGraph(deps: AuditDependencies) -> Any:
 
     graph = StateGraph(AuditState)
     for name, node in (("ingest", ingest), ("extract", extract), ("reconcile", reconcile), ("plan", plan),
-                       ("audit", audit), ("finalize", finalize)):
+                       ("audit", audit), ("remediate", remediate), ("finalize", finalize)):
         graph.add_node(name, node)
     graph.add_edge(START, "ingest")
     graph.add_edge("ingest", "extract")
     graph.add_edge("extract", "reconcile")
     graph.add_conditional_edges("reconcile", lambda s: "finalize" if s["halted"] else "plan", {"finalize": "finalize", "plan": "plan"})
     graph.add_edge("plan", "audit")
-    graph.add_edge("audit", "finalize")
+    graph.add_edge("audit", "remediate")
+    graph.add_edge("remediate", "finalize")
     graph.add_edge("finalize", END)
     return graph.compile()
 
@@ -291,7 +338,8 @@ def runAudit(project: Project, packetId: str, deps: AuditDependencies, startedAt
     """Runs the graph and returns (packet at PENDING_HUMAN_APPROVAL, summary, proof checks with refreshed statuses)."""
     final: AuditState = buildAuditGraph(deps).invoke({"project": project, "packetId": packetId, "flags": [], "evidence": [],
                                                       "reports": [], "plan": [], "proofChecks": list(project.proofChecks),
-                                                      "repoAudit": None, "halted": False, "confusionIndex": 0})
+                                                      "repoAudit": None, "halted": False, "confusionIndex": 0,
+                                                      "features": [], "alignmentAvailable": False, "remediations": []})
     proofChecks = tuple(final.get("proofChecks", project.proofChecks))
     packet = SubmissionPacket(
         packetId=packetId, approvalState=ApprovalState.AUDITING, charter=project.charter, proofChecks=proofChecks,
@@ -302,5 +350,6 @@ def runAudit(project: Project, packetId: str, deps: AuditDependencies, startedAt
     summary = AuditSummary(packetId=packetId, projectId=project.projectId, startedAt=startedAt, finishedAt=utcNow(),
                            plan=tuple(final["plan"]), rules=tuple(final.get("rules", [])),
                            effectiveDeadline=final.get("effectiveDeadline"), confusionIndex=final["confusionIndex"],
-                           confusionThreshold=deps.confusionThreshold, halted=final["halted"])
+                           confusionThreshold=deps.confusionThreshold, halted=final["halted"],
+                           remediations=tuple(final.get("remediations", [])))
     return packet, summary, proofChecks

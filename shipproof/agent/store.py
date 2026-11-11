@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from shipproof.agent.project import AuditSummary, Project
+from shipproof.remediation import Remediation, RemediationStatus
 from shipproof.models import (
     AGENT_ACTOR,
     ApprovalState,
@@ -50,6 +51,7 @@ class ProjectStore:
         self._packets: dict[str, SubmissionPacket] = {}
         self._summaries: dict[str, AuditSummary] = {}
         self._running: set[str] = set()
+        self._applying: set[tuple[str, str]] = set()
         if dataFile is not None and dataFile.is_file():
             self._load(dataFile)
 
@@ -132,6 +134,45 @@ class ProjectStore:
             self._packets[packetId] = updated
             self._save()
             return updated
+
+    def getRemediation(self, packetId: str, remediationId: str) -> Remediation:
+        with self._lock:
+            summary = self.getSummary(packetId)
+            matches = [r for r in (summary.remediations if summary else ()) if r.remediationId == remediationId]
+            if not matches:
+                raise NotFoundError(f"remediation {remediationId} not found for {packetId}")
+            return matches[0]
+
+    def beginApply(self, packetId: str, remediationId: str) -> Remediation:
+        """Claims a remediation so concurrent clicks cannot open two pull requests."""
+        with self._lock:
+            remediation = self.getRemediation(packetId, remediationId)
+            if remediation.status is not RemediationStatus.PROPOSED:
+                raise ConflictError(f"remediation is already {remediation.status.value.lower()}")
+            if (packetId, remediationId) in self._applying:
+                raise ConflictError("remediation is already being applied")
+            self._applying.add((packetId, remediationId))
+            return remediation
+
+    def finishRemediation(self, packetId: str, remediationId: str, status: RemediationStatus,
+                          pullRequestUrl: Optional[str] = None) -> Remediation:
+        with self._lock:
+            try:
+                summary = self.getSummary(packetId)
+                if summary is None:
+                    raise NotFoundError(f"no audit summary for {packetId}")
+                updated = self.getRemediation(packetId, remediationId).model_copy(
+                    update={"status": status, "pullRequestUrl": pullRequestUrl})
+                self._summaries[packetId] = summary.model_copy(update={"remediations": tuple(
+                    updated if r.remediationId == remediationId else r for r in summary.remediations)})
+                self._save()
+                return updated
+            finally:
+                self._applying.discard((packetId, remediationId))
+
+    def releaseApply(self, packetId: str, remediationId: str) -> None:
+        with self._lock:
+            self._applying.discard((packetId, remediationId))
 
     def beginAudit(self, projectId: str) -> tuple[Project, str]:
         with self._lock:

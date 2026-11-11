@@ -21,6 +21,7 @@ from shipproof.models import (
     WorkbenchCheck,
 )
 from shipproof.prompts import GroundedRule
+from shipproof.remediation import Remediation
 
 MAX_LINKS = 20
 MAX_RULE_PAGES = 10
@@ -64,6 +65,7 @@ class AuditSummary(FrozenModel):
     confusionThreshold: Annotated[int, Field(ge=1, le=100)]
     halted: bool = False
     error: Optional[ShortText] = None
+    remediations: tuple[Remediation, ...] = ()
 
 
 SEVERITY_WEIGHT: dict[Severity, int] = {Severity.LOW: 1, Severity.MEDIUM: 3, Severity.HIGH: 6, Severity.CRITICAL: 10}

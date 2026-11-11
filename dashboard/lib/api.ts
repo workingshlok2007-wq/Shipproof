@@ -1,4 +1,4 @@
-import type { AuditEvent, PacketView, Project, SourceRef, SubmissionPacket } from "./types";
+import type { AuditEvent, PacketView, Project, Remediation, SourceRef, SubmissionPacket } from "./types";
 
 const TOKEN_KEY = "shipproofToken";
 const API_BASE = "/api";
@@ -106,6 +106,10 @@ export function createClient(token: string) {
       request<{ events: AuditEvent[]; next: number }>(token, `/packets/${enc(packetId)}/events?after=${after}`),
     confirmCoverage: (packetId: string) => request<SubmissionPacket>(token, `/packets/${enc(packetId)}/coverage/confirm`, "POST"),
     approve: (packetId: string) => request<SubmissionPacket>(token, `/packets/${enc(packetId)}/approve`, "POST"),
+    applyRemediation: (packetId: string, remediationId: string, body: { licenseKey?: string; copyrightHolder?: string }) =>
+      request<Remediation>(token, `/packets/${enc(packetId)}/remediations/${enc(remediationId)}/apply`, "POST", body),
+    dismissRemediation: (packetId: string, remediationId: string) =>
+      request<Remediation>(token, `/packets/${enc(packetId)}/remediations/${enc(remediationId)}/dismiss`, "POST"),
     reject: (packetId: string) => request<SubmissionPacket>(token, `/packets/${enc(packetId)}/reject`, "POST"),
   };
 }
