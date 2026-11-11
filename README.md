@@ -67,7 +67,7 @@ npm install
 npm run build && npm start        # or: npm run dev
 ```
 
-Open http://localhost:3000 and paste the contents of `.shipproof-token`. The dashboard proxies `/api/*` to the engine (`SHIPPROOF_API_URL`, default `http://127.0.0.1:8000`), so only port 3000 needs to be reachable from the browser.
+Open http://localhost:3000. There is no login screen: the dashboard server reads the engine token from `SHIPPROOF_API_TOKEN` or `../.shipproof-token` and attaches it to every request itself, so the token never reaches the browser. That makes the dashboard the access boundary, so it listens on 127.0.0.1 only (in Codespaces keep the forwarded port private). Cross-site POSTs are refused. The engine address is `SHIPPROOF_API_URL` (default `http://127.0.0.1:8000`).
 
 Optional environment: `GITHUB_TOKEN` (5000 instead of 60 GitHub requests per hour), `GITHUB_WRITE_TOKEN` (needed only to apply suggested fixes: a fine-grained token for the one repository with Contents and Pull requests set to read/write; it can only write `README.md` and `LICENSE` on a new branch), `GMAIL_CLIENT_SECRETS` and `GMAIL_TOKEN_FILE` (authorise once with `python -m shipproof.tools.gmailIngest`), `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS`, `SHIPPROOF_CONFUSION_THRESHOLD` (default 15), `SHIPPROOF_DATA_FILE`.
 

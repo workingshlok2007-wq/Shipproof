@@ -1,30 +1,11 @@
 import type { AuditEvent, PacketView, Project, Remediation, SourceRef, SubmissionPacket } from "./types";
 
-const TOKEN_KEY = "shipproofToken";
 const API_BASE = "/api";
 const REQUEST_TIMEOUT_MS = 30_000;
 
 export class ApiError extends Error {
   constructor(public readonly status: number, message: string) {
     super(message);
-  }
-}
-
-// sessionStorage: the token dies with the tab and is never shared across tabs or written to disk long-term.
-export function loadToken(): string | null {
-  try {
-    return window.sessionStorage.getItem(TOKEN_KEY);
-  } catch {
-    return null; // storage blocked (private mode / policy): the user re-enters the token each load
-  }
-}
-
-export function saveToken(token: string | null): void {
-  try {
-    if (token) window.sessionStorage.setItem(TOKEN_KEY, token);
-    else window.sessionStorage.removeItem(TOKEN_KEY);
-  } catch {
-    // storage blocked: token stays in memory for this page only
   }
 }
 
@@ -44,14 +25,15 @@ function describeDetail(detail: unknown): string {
   return "request failed";
 }
 
-async function request<T>(token: string, path: string, method: "GET" | "POST" = "GET", body?: unknown): Promise<T> {
+async function request<T>(path: string, method: "GET" | "POST" = "GET", body?: unknown): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetch(`${API_BASE}${path}`, {
       method,
-      headers: { Authorization: `Bearer ${token}`, ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
+      // The dashboard server adds the engine token; this header lets it refuse cross-site POSTs (CSRF).
+      headers: { "X-ShipProof-Request": "1", ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: controller.signal,
       cache: "no-store",
@@ -82,35 +64,35 @@ async function request<T>(token: string, path: string, method: "GET" | "POST" = 
 
 const enc = encodeURIComponent;
 
-export function createClient(token: string) {
+export function createClient() {
   return {
-    listProjects: () => request<{ projectIds: string[] }>(token, "/projects"),
-    getProject: (projectId: string) => request<Project>(token, `/projects/${enc(projectId)}`),
+    listProjects: () => request<{ projectIds: string[] }>("/projects"),
+    getProject: (projectId: string) => request<Project>(`/projects/${enc(projectId)}`),
     createProject: (body: Omit<Project, "charter" | "proofChecks" | "workbenchChecks" | "packetIds">) =>
-      request<Project>(token, "/projects", "POST", body),
+      request<Project>("/projects", "POST", body),
     addClause: (projectId: string, body: { clauseId: string; text: string; sourceRef: SourceRef }) =>
-      request<Project>(token, `/projects/${enc(projectId)}/clauses`, "POST", body),
+      request<Project>(`/projects/${enc(projectId)}/clauses`, "POST", body),
     amend: (projectId: string, body: { amendmentId: string; clauseId: string; newText: string; sourceRef: SourceRef }) =>
-      request<Project>(token, `/projects/${enc(projectId)}/amendments`, "POST", body),
+      request<Project>(`/projects/${enc(projectId)}/amendments`, "POST", body),
     addProof: (projectId: string, body: { checkId: string; clauseId: string; interpretation: string }) =>
-      request<Project>(token, `/projects/${enc(projectId)}/proof-checks`, "POST", body),
+      request<Project>(`/projects/${enc(projectId)}/proof-checks`, "POST", body),
     reconfirm: (projectId: string, checkId: string, interpretation: string) =>
-      request<Project>(token, `/projects/${enc(projectId)}/proof-checks/${enc(checkId)}/reconfirm`, "POST", { interpretation }),
+      request<Project>(`/projects/${enc(projectId)}/proof-checks/${enc(checkId)}/reconfirm`, "POST", { interpretation }),
     promote: (projectId: string, checkId: string) =>
-      request<Project>(token, `/projects/${enc(projectId)}/proof-checks/${enc(checkId)}/promote`, "POST"),
+      request<Project>(`/projects/${enc(projectId)}/proof-checks/${enc(checkId)}/promote`, "POST"),
     addWorkbench: (projectId: string, body: { checkId: string; tier: number; label: string; description: string | null }) =>
-      request<Project>(token, `/projects/${enc(projectId)}/workbench`, "POST", body),
-    triggerAudit: (projectId: string) => request<{ packetId: string }>(token, `/projects/${enc(projectId)}/trigger-audit`, "POST"),
-    getPacket: (packetId: string) => request<PacketView>(token, `/packets/${enc(packetId)}`),
+      request<Project>(`/projects/${enc(projectId)}/workbench`, "POST", body),
+    triggerAudit: (projectId: string) => request<{ packetId: string }>(`/projects/${enc(projectId)}/trigger-audit`, "POST"),
+    getPacket: (packetId: string) => request<PacketView>(`/packets/${enc(packetId)}`),
     getEvents: (packetId: string, after: number) =>
-      request<{ events: AuditEvent[]; next: number }>(token, `/packets/${enc(packetId)}/events?after=${after}`),
-    confirmCoverage: (packetId: string) => request<SubmissionPacket>(token, `/packets/${enc(packetId)}/coverage/confirm`, "POST"),
-    approve: (packetId: string) => request<SubmissionPacket>(token, `/packets/${enc(packetId)}/approve`, "POST"),
+      request<{ events: AuditEvent[]; next: number }>(`/packets/${enc(packetId)}/events?after=${after}`),
+    confirmCoverage: (packetId: string) => request<SubmissionPacket>(`/packets/${enc(packetId)}/coverage/confirm`, "POST"),
+    approve: (packetId: string) => request<SubmissionPacket>(`/packets/${enc(packetId)}/approve`, "POST"),
     applyRemediation: (packetId: string, remediationId: string, body: { licenseKey?: string; copyrightHolder?: string }) =>
-      request<Remediation>(token, `/packets/${enc(packetId)}/remediations/${enc(remediationId)}/apply`, "POST", body),
+      request<Remediation>(`/packets/${enc(packetId)}/remediations/${enc(remediationId)}/apply`, "POST", body),
     dismissRemediation: (packetId: string, remediationId: string) =>
-      request<Remediation>(token, `/packets/${enc(packetId)}/remediations/${enc(remediationId)}/dismiss`, "POST"),
-    reject: (packetId: string) => request<SubmissionPacket>(token, `/packets/${enc(packetId)}/reject`, "POST"),
+      request<Remediation>(`/packets/${enc(packetId)}/remediations/${enc(remediationId)}/dismiss`, "POST"),
+    reject: (packetId: string) => request<SubmissionPacket>(`/packets/${enc(packetId)}/reject`, "POST"),
   };
 }
 

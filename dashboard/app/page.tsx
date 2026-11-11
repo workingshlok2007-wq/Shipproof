@@ -1,39 +1,19 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AuditView } from "@/components/AuditView";
 import { ProjectForm } from "@/components/ProjectForm";
 import { TierBoard } from "@/components/TierBoard";
-import { Button, Card, Empty, ErrorNote, Field, SafeLink } from "@/components/ui";
+import { Button, Card, Empty, ErrorNote, SafeLink } from "@/components/ui";
 import { useAction } from "@/components/useAction";
-import { createClient, loadToken, saveToken } from "@/lib/api";
+import { createClient } from "@/lib/api";
 import type { PacketView, Project } from "@/lib/types";
 import { useAuditStream } from "@/lib/useAuditStream";
 
 const PACKET_REFRESH_MS = 2000;
 const REFRESH_KINDS = new Set(["evidence", "flag", "alignment", "proofCheck", "plan", "done", "decision"]);
 
-function TokenGate({ onToken }: { onToken: (token: string) => void }) {
-  const [value, setValue] = useState("");
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    if (value.trim().length >= 24) onToken(value.trim());
-  };
-  return (
-    <main className="grid min-h-screen place-items-center p-6">
-      <form onSubmit={submit} className="clay w-full max-w-md space-y-4 p-8">
-        <h1 className="text-2xl font-semibold tracking-tight">ShipProof</h1>
-        <p className="text-sm text-muted">Paste the engine API token (the contents of <span className="font-mono">.shipproof-token</span>). It is kept in this tab only.</p>
-        <Field label="API token"><input className="field font-mono" type="password" autoComplete="off" minLength={24} required value={value} onChange={(e) => setValue(e.target.value)} /></Field>
-        <Button type="submit" variant="primary" className="w-full">Connect</Button>
-      </form>
-    </main>
-  );
-}
-
 export default function Home() {
-  const [token, setToken] = useState<string | null>(null);
-  const [tokenLoaded, setTokenLoaded] = useState(false);
   const [projectIds, setProjectIds] = useState<string[]>([]);
   const [project, setProject] = useState<Project | null>(null);
   const [creating, setCreating] = useState(false);
@@ -41,37 +21,18 @@ export default function Home() {
   const [view, setView] = useState<PacketView | null>(null);
   const { busy, error, run, setError } = useAction();
 
-  useEffect(() => {
-    setToken(loadToken());
-    setTokenLoaded(true);
-  }, []);
-  const client = useMemo(() => (token ? createClient(token) : null), [token]);
-  const stream = useAuditStream(client, token, packetId);
-
-  const signOut = useCallback(() => {
-    saveToken(null);
-    setToken(null);
-    setProject(null);
-    setPacketId(null);
-    setView(null);
-  }, []);
+  const [client] = useState(createClient);
+  const stream = useAuditStream(client, packetId);
 
   useEffect(() => {
-    if (!client) return;
     void run(async () => {
-      try {
-        const { projectIds: ids } = await client.listProjects();
-        setProjectIds(ids);
-        setCreating(ids.length === 0);
-      } catch (failure) {
-        if (failure instanceof Error && "status" in failure && (failure as { status: number }).status === 401) signOut();
-        throw failure;
-      }
+      const { projectIds: ids } = await client.listProjects();
+      setProjectIds(ids);
+      setCreating(ids.length === 0);
     });
-  }, [client, run, signOut]);
+  }, [client, run]);
 
   const openProject = useCallback(async (projectId: string) => {
-    if (!client) return;
     const loaded = await run(() => client.getProject(projectId));
     if (loaded) {
       setProject(loaded);
@@ -81,7 +42,7 @@ export default function Home() {
   }, [client, run]);
 
   const refreshPacket = useCallback(async () => {
-    if (!client || !packetId) return;
+    if (!packetId) return;
     try {
       setView(await client.getPacket(packetId));
     } catch (failure) {
@@ -97,7 +58,7 @@ export default function Home() {
   const lastEventKind = stream.events.at(-1)?.kind;
   useEffect(() => {
     if (lastEventKind && REFRESH_KINDS.has(lastEventKind)) void refreshPacket();
-    if (lastEventKind === "done" && client && project) void client.getProject(project.projectId).then(setProject, () => undefined);
+    if (lastEventKind === "done" && project) void client.getProject(project.projectId).then(setProject, () => undefined);
   }, [stream.events.length, lastEventKind, refreshPacket, client, project?.projectId]);
 
   useEffect(() => {
@@ -107,18 +68,13 @@ export default function Home() {
   }, [view?.packet.approvalState, refreshPacket]);
 
   const triggerAudit = async () => {
-    if (!client || !project) return;
+    if (!project) return;
     const started = await run(() => client.triggerAudit(project.projectId));
     if (started) {
       setProject({ ...project, packetIds: [...project.packetIds, started.packetId] });
       setPacketId(started.packetId);
     }
   };
-
-  if (!tokenLoaded) return null;
-  if (!token || !client) {
-    return <TokenGate onToken={(value) => { saveToken(value); setToken(value); }} />;
-  }
 
   return (
     <main className="mx-auto max-w-7xl space-y-6 px-4 pb-40 pt-8 sm:px-6">
@@ -133,7 +89,6 @@ export default function Home() {
             {projectIds.map((id) => <option key={id} value={id}>{id}</option>)}
           </select>
           <Button onClick={() => { setCreating(true); setProject(null); setPacketId(null); }}>New project</Button>
-          <Button onClick={signOut}>Sign out</Button>
         </div>
       </header>
       <ErrorNote message={error} />
