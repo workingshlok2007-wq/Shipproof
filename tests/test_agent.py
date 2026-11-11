@@ -181,6 +181,23 @@ class TestGraph:
         assert any(f.kind is UncertaintyKind.CONFUSION_THRESHOLD_EXCEEDED for f in packet.uncertaintyFlags)
         assert "plan" not in events
 
+    def test_definiteFailuresAreEvidenceNotFlags(self):
+        def thinRepo(repo: str):
+            payload = repoAuditPayload()
+            payload.update(readmeStatus="FAIL", licenseStatus="FAIL", licenseSpdx=None)
+            return payload
+        tools = fakeTools()
+        tools["auditRepository"] = StructuredTool.from_function(thinRepo, name="auditRepository", description="x")
+        packet, _, _ = runAudit(makeProject(), "pkt-1", deps(tools), utcNow())
+        statuses = {e.evidenceId: e.status for e in packet.evidence}
+        assert statuses["repoReadme"] is CheckStatus.FAIL and statuses["repoLicense"] is CheckStatus.FAIL
+        assert all("README" not in f.detail and "license" not in f.detail for f in packet.uncertaintyFlags)
+
+    def test_thresholdRecheckedAfterAudit(self):
+        packet, summary, _ = runAudit(makeProject(), "pkt-1", deps(fakeTools(linkAuthWall=True), threshold=12), utcNow())
+        assert not summary.halted and summary.confusionIndex > 12
+        assert packet.uncertaintyFlags[-1].kind is UncertaintyKind.CONFUSION_THRESHOLD_EXCEEDED
+
     def test_llmUnavailableDegradesToFlags(self):
         packet, _, _ = runAudit(makeProject(), "pkt-1", deps(llm=None), utcNow())
         assert packet.reports == () and any(f.kind is UncertaintyKind.ANALYSIS_FAILED for f in packet.uncertaintyFlags)

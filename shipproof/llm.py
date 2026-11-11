@@ -15,7 +15,7 @@ from typing import Any, Optional, Protocol, TypeVar
 from pydantic import BaseModel, ValidationError
 
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
-DEFAULT_FALLBACK_MODELS = ("gemini-2.5-flash",)
+DEFAULT_FALLBACK_MODELS = ("gemini-3.5-flash",)  # gemini-2.5-flash returns 404 for new API users
 MAX_FALLBACK_MODELS = 3
 MAX_RETRY_DELAY_SECONDS = 8.0
 FALLBACK_STATUS_CODES = frozenset({404, 429, 500, 502, 503, 504})

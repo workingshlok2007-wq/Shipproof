@@ -1,5 +1,8 @@
 """Audit agent: Ingest -> Extract -> Reconcile -> Gate -> Plan -> Audit -> Finalize, as a LangGraph state machine.
 
+Uncertainty flags record what the agent cannot confirm. Definite results (README missing, license missing) are
+FAIL evidence only, so they do not inflate the confusion index.
+
 The agent never approves, submits or sends anything. It ends every run at PENDING_HUMAN_APPROVAL.
 If the structural confusion index exceeds the threshold after reconciliation, it halts before auditing and asks the human.
 """
@@ -195,21 +198,21 @@ def buildAuditGraph(deps: AuditDependencies) -> Any:
             repoAudit = RepoAudit.model_validate(deps.tools["auditRepository"].invoke({"repo": project.repo}))
             evidence.append(repoAudit.visibilityEvidence)
             repoUrl = repoAudit.visibilityEvidence.url
-            for evidenceId, status, label in (("repoReadme", repoAudit.readmeStatus, "README populated"),
-                                              ("repoLicense", repoAudit.licenseStatus, "Open-source license present")):
+            for evidenceId, status, passText, failText in (
+                ("repoReadme", repoAudit.readmeStatus, "README is populated.", "README missing or under 200 characters."),
+                ("repoLicense", repoAudit.licenseStatus, f"License: {repoAudit.licenseSpdx}.", "No open-source license detected."),
+            ):
                 evidence.append(EvidenceItem(evidenceId=evidenceId, url=repoUrl, method=EvidenceMethod.GITHUB_API,
                                              finalStatus=200 if status is CheckStatus.PASS else None, authWallDetected=False,
-                                             status=status, checkedAt=utcNow(), detail=label if status is CheckStatus.PASS else f"{label}: failed"))
+                                             status=status, checkedAt=utcNow(),
+                                             detail=passText if status is CheckStatus.PASS else failText if status is CheckStatus.FAIL
+                                             else "Not checked: repository content unavailable."))
             sources.append(SourceRecord(sourceId=makeSourceId("repository", project.repo), kind=SourceKind.REPOSITORY,
                                         location=repoUrl, status=SourceStatus.CHECKED, retrievedAt=utcNow(),
                                         contentSha256=hashlib.sha256((repoAudit.readmeText or "").encode()).hexdigest()))
             if not repoAudit.isPubliclyVisible:
                 specs.append(FlagSpec(UncertaintyKind.AUTH_REDIRECT, Severity.CRITICAL,
                                       f"Repository is not visible to logged-out judges. {' '.join(repoAudit.issues)}", ()))
-            for status, label in ((repoAudit.readmeStatus, "README missing or too short."),
-                                  (repoAudit.licenseStatus, "No open-source license detected.")):
-                if status is CheckStatus.FAIL:
-                    specs.append(FlagSpec(UncertaintyKind.MISSING_SOURCE_CATEGORY, Severity.HIGH, label, ()))
         except Exception as error:  # GitHub errors become evidence of an unreachable source
             sources.append(unreachableSource(project.repo, SourceKind.REPOSITORY, f"{type(error).__name__}: {error}"))
             specs.append(FlagSpec(UncertaintyKind.UNREACHABLE_SOURCE, Severity.CRITICAL, f"Repository audit failed: {error}"[:500], ()))
@@ -261,7 +264,14 @@ def buildAuditGraph(deps: AuditDependencies) -> Any:
         specs = [FlagSpec(UncertaintyKind.MISSING_SOURCE_CATEGORY, Severity.MEDIUM,
                           f"No checked source of type {kind}; coverage is incomplete.", ()) for kind in missing]
         flags = _addFlags(state, specs, emit)
-        return {"flags": flags, "confusionIndex": computeConfusionIndex(flags)}
+        index = computeConfusionIndex(flags)
+        if index > deps.confusionThreshold and not state["halted"]:
+            flags = _addFlags({"flags": flags}, [FlagSpec(
+                UncertaintyKind.CONFUSION_THRESHOLD_EXCEEDED, Severity.CRITICAL,
+                f"Confusion index {index} exceeds threshold {deps.confusionThreshold} after auditing. "
+                "Resolve the flagged items and re-run before approving.", ())], emit)
+        emit("confusion", {"index": index, "threshold": deps.confusionThreshold, "halted": state["halted"]})
+        return {"flags": flags, "confusionIndex": index}
 
     graph = StateGraph(AuditState)
     for name, node in (("ingest", ingest), ("extract", extract), ("reconcile", reconcile), ("plan", plan),
