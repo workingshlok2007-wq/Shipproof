@@ -318,8 +318,9 @@ class ProofCheck(FrozenModel):
         if self.promotedBy is not None:
             if not self.promotedBy.isHuman or not self.authoredBy.isHuman:
                 raise ValueError("promotion requires human author and human promoter")
-            if ROLE_RANK[self.promotedBy.role] <= ROLE_RANK[self.authoredBy.role]:  # type: ignore[index]
-                raise ValueError("promoter must hold strictly higher access than author")
+            ownerSelfPromotion = self.promotedBy.role is Role.OWNER and self.authoredBy.role is Role.OWNER
+            if not ownerSelfPromotion and ROLE_RANK[self.promotedBy.role] <= ROLE_RANK[self.authoredBy.role]:  # type: ignore[index]
+                raise ValueError("promoter must hold strictly higher access than author (OWNER may self-promote)")
         return self
 
     @property
@@ -528,6 +529,10 @@ class SubmissionPacket(FrozenModel):
                 raise ValueError("APPROVED requires human-confirmed coverage ledger")
             if any(c.status is CheckStatus.STALE for c in self.proofChecks):
                 raise ValueError("APPROVED blocked: STALE proof checks require reconfirmation")
+            if any(c.status is CheckStatus.FAIL for c in self.gatingChecks):
+                raise ValueError("APPROVED blocked: promoted proof check has FAIL status")
+            if any(f.severity is Severity.CRITICAL for f in self.uncertaintyFlags):
+                raise ValueError("APPROVED blocked: open CRITICAL uncertainty flag")
         return self
 
     @property

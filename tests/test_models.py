@@ -18,12 +18,15 @@ from shipproof.models import (
     ModelError,
     ProofCheck,
     Role,
+    Severity,
     SourceKind,
     SourceRecord,
     SourceRef,
     SourceRefKind,
     SourceStatus,
     SubmissionPacket,
+    UncertaintyFlag,
+    UncertaintyKind,
     WorkbenchCheck,
     addCharterClause,
     applyAmendment,
@@ -36,6 +39,7 @@ from shipproof.models import (
 
 NOW = datetime(2026, 11, 11, tzinfo=timezone.utc)
 OWNER = Actor(actorId="owner", kind=ActorKind.HUMAN, role=Role.OWNER)
+SENIOR = Actor(actorId="senior", kind=ActorKind.HUMAN, role=Role.SENIOR)
 JUNIOR = Actor(actorId="junior", kind=ActorKind.HUMAN, role=Role.JUNIOR)
 AGENT = Actor(actorId="agent", kind=ActorKind.AGENT)
 REF = SourceRef(kind=SourceRefKind.URL, value="https://event.example/rules")
@@ -159,6 +163,15 @@ class TestProof:
         with pytest.raises(ValidationError):
             promoteProofCheck(makeCheck("p1", "c1"), makeCharter(), AGENT)
 
+    def test_ownerMaySelfPromote(self):
+        ownCheck = makeCheck("p1", "c1").model_copy(update={"authoredBy": OWNER})
+        assert promoteProofCheck(ownCheck, makeCharter(), OWNER).isPromoted
+
+    def test_nonOwnerCannotSelfPromote(self):
+        seniorCheck = makeCheck("p1", "c1").model_copy(update={"authoredBy": SENIOR})
+        with pytest.raises(ValidationError):
+            promoteProofCheck(seniorCheck, makeCharter(), SENIOR)
+
     def test_promotionRequiresPassAndCurrentVersion(self):
         with pytest.raises(ModelError):
             promoteProofCheck(makeCheck("p1", "c1", CheckStatus.UNVERIFIED), makeCharter(), OWNER)
@@ -263,6 +276,30 @@ class TestPacket:
         with pytest.raises(ValidationError):
             transitionPacket(packet, ApprovalState.APPROVED, OWNER)
         assert transitionPacket(packet, ApprovalState.REJECTED, OWNER).approvalState is ApprovalState.REJECTED
+
+    def test_approvalBlockedByPromotedFail(self):
+        ledger = confirmCoverage(CoverageLedger(sources=(makeSource(),)), OWNER)
+        promoted = promoteProofCheck(makeCheck("p1", "c1"), makeCharter(), OWNER).model_copy(update={"status": CheckStatus.FAIL})
+        packet = pendingPacket(ledger=ledger, proofChecks=(promoted, makeCheck("p2", "c2", CheckStatus.FAIL)))
+        with pytest.raises(ValidationError):
+            transitionPacket(packet, ApprovalState.APPROVED, OWNER)
+
+    def test_unpromotedFailDoesNotBlock(self):
+        ledger = confirmCoverage(CoverageLedger(sources=(makeSource(),)), OWNER)
+        packet = pendingPacket(ledger=ledger, proofChecks=(makeCheck("p2", "c2", CheckStatus.FAIL),))
+        assert transitionPacket(packet, ApprovalState.APPROVED, OWNER).approvalState is ApprovalState.APPROVED
+
+    @pytest.mark.parametrize("severity,blocked", [(Severity.CRITICAL, True), (Severity.HIGH, False)])
+    def test_approvalBlockedOnlyByCriticalFlag(self, severity, blocked):
+        ledger = confirmCoverage(CoverageLedger(sources=(makeSource(),)), OWNER)
+        flag = UncertaintyFlag(flagId="f1", kind=UncertaintyKind.AUTH_REDIRECT, detail="Demo video redirects to login.",
+                               severity=severity, raisedAt=NOW)
+        packet = pendingPacket(ledger=ledger, uncertaintyFlags=(flag,))
+        if blocked:
+            with pytest.raises(ValidationError):
+                transitionPacket(packet, ApprovalState.APPROVED, OWNER)
+        else:
+            assert transitionPacket(packet, ApprovalState.APPROVED, OWNER).approvalState is ApprovalState.APPROVED
 
     @pytest.mark.parametrize("start,target", [
         (ApprovalState.DRAFT, ApprovalState.APPROVED),
