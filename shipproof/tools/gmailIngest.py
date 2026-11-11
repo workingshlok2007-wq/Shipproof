@@ -45,8 +45,10 @@ class EmailMessage(FrozenModel):
     bodyTruncated: bool
 
 
-def loadGmailCredentials(clientSecretsPath: Optional[str] = None, tokenPath: Optional[str] = None) -> Any:
-    """Loads cached credentials, refreshing if expired; otherwise runs the local-server OAuth consent flow once."""
+def loadGmailCredentials(clientSecretsPath: Optional[str] = None, tokenPath: Optional[str] = None,
+                         interactive: bool = True) -> Any:
+    """Loads cached credentials, refreshing if expired. Runs the browser consent flow only when interactive=True;
+    servers pass interactive=False and fail fast instead of blocking on a login page."""
     from google.auth.exceptions import GoogleAuthError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -63,6 +65,8 @@ def loadGmailCredentials(clientSecretsPath: Optional[str] = None, tokenPath: Opt
         if credentials and credentials.expired and credentials.refresh_token:
             credentials.refresh(Request())
         if not credentials or not credentials.valid:
+            if not interactive:
+                raise GmailError("no valid cached Gmail token; run: python -m shipproof.tools.gmailIngest")
             if not secrets.is_file():
                 raise GmailError("GMAIL_CLIENT_SECRETS does not point to an OAuth client JSON file")
             flow = InstalledAppFlow.from_client_secrets_file(str(secrets), list(GMAIL_SCOPES))
@@ -158,3 +162,8 @@ def fetchEmails(service: Any, query: str, maxResults: int = 25) -> tuple[EmailMe
     except HttpError as error:
         raise GmailError(f"Gmail API error {error.resp.status}: {error.reason}") from error
     return tuple(sorted(messages, key=lambda m: m.sentAt, reverse=True))
+
+
+if __name__ == "__main__":
+    loadGmailCredentials(interactive=True)
+    print("Gmail token saved to", os.environ.get("GMAIL_TOKEN_FILE"))

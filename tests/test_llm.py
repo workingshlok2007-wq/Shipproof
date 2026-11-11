@@ -155,7 +155,8 @@ class TestWrapUntrusted:
         assert len({newNonce() for _ in range(100)}) == 100
 
 
-@pytest.mark.skipif(not os.environ.get("GEMINI_API_KEY"), reason="live test requires GEMINI_API_KEY")
+@pytest.mark.skipif(os.environ.get("SHIPPROOF_LIVE_TESTS") != "1" or not os.environ.get("GEMINI_API_KEY"),
+                    reason="live test: set SHIPPROOF_LIVE_TESTS=1 and GEMINI_API_KEY")
 def test_liveGeminiSmoke():
     client = GeminiClient(GeminiConfig.fromEnvironment())
     assert generateStructured(client, "Return value 7.", "Respond now.", Echo).value == 7

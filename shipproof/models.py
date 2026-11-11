@@ -152,6 +152,8 @@ class UncertaintyKind(str, Enum):
     MISSING_SOURCE_CATEGORY = "MISSING_SOURCE_CATEGORY"
     PROMPT_INJECTION_SUSPECTED = "PROMPT_INJECTION_SUSPECTED"
     UNGROUNDED_MODEL_OUTPUT = "UNGROUNDED_MODEL_OUTPUT"
+    ANALYSIS_FAILED = "ANALYSIS_FAILED"
+    CONFUSION_THRESHOLD_EXCEEDED = "CONFUSION_THRESHOLD_EXCEEDED"
 
 
 class Severity(str, Enum):
@@ -192,6 +194,9 @@ class Actor(FrozenModel):
     @property
     def isHuman(self) -> bool:
         return self.kind is ActorKind.HUMAN
+
+
+AGENT_ACTOR = Actor(actorId="shipproofAgent", kind=ActorKind.AGENT)
 
 
 class SourceRef(FrozenModel):
