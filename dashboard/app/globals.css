@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #FAF6F1;
+  --color-surface: #FFFDF9;
+  --color-sunken: #F3ECE4;
+  --color-ink: #3B2F2A;
+  --color-muted: #8A7D74;
+  --color-line: #E8DED3;
+  --color-accent: #C9805F;
+  --color-accent-deep: #A9644A;
+  --color-pass: #4F7F55;
+  --color-fail: #B5523B;
+  --color-stale: #B88A2E;
+  --color-unverified: #7F766E;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html, body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+@layer components {
+  .clay {
+    background: var(--color-surface);
+    border-radius: 1.75rem;
+    box-shadow:
+      10px 12px 28px rgba(150, 115, 90, 0.16),
+      -8px -8px 22px rgba(255, 255, 255, 0.95),
+      inset 2px 2px 3px rgba(255, 255, 255, 0.8),
+      inset -3px -3px 8px rgba(201, 128, 95, 0.07);
+  }
+  .clay-inset {
+    background: var(--color-sunken);
+    border-radius: 1.1rem;
+    box-shadow: inset 3px 3px 8px rgba(150, 115, 90, 0.14), inset -3px -3px 8px rgba(255, 255, 255, 0.85);
+  }
+  .clay-button {
+    border-radius: 9999px;
+    box-shadow: 4px 5px 12px rgba(150, 115, 90, 0.2), -3px -3px 8px rgba(255, 255, 255, 0.9);
+    transition: transform 120ms ease, box-shadow 120ms ease;
+  }
+  .clay-button:active:not(:disabled) {
+    transform: translateY(1px);
+    box-shadow: inset 2px 2px 6px rgba(150, 115, 90, 0.25);
+  }
+  .clay-button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .field {
+    width: 100%;
+    background: var(--color-sunken);
+    border-radius: 0.9rem;
+    padding: 0.55rem 0.8rem;
+    font-size: 0.875rem;
+    box-shadow: inset 2px 2px 6px rgba(150, 115, 90, 0.14), inset -2px -2px 6px rgba(255, 255, 255, 0.8);
+    outline: none;
+  }
+  .field:focus-visible {
+    box-shadow: inset 2px 2px 6px rgba(150, 115, 90, 0.14), 0 0 0 2px var(--color-accent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

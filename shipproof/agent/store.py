@@ -95,6 +95,10 @@ class ProjectStore:
             self._save()
             return project
 
+    def listProjectIds(self) -> list[str]:
+        with self._lock:
+            return sorted(self._projects)
+
     def getProject(self, projectId: str) -> Project:
         with self._lock:
             if projectId not in self._projects:
@@ -212,6 +216,10 @@ class EventBus:
                 queue.get_nowait()
             queue.put_nowait({"packetId": event["packetId"], "kind": "overflow", "at": event["at"],
                               "data": {"message": "events dropped; re-fetch the packet"}})
+
+    def history(self, packetId: str, after: int = 0) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._history.get(packetId, [])[max(0, after):])
 
     def subscribe(self, packetId: str) -> tuple[asyncio.Queue, list[dict[str, Any]]]:
         queue: asyncio.Queue = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_SIZE)

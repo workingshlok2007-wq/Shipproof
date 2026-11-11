@@ -329,6 +329,16 @@ class TestApi:
         assert packet.approvalState is ApprovalState.PENDING_HUMAN_APPROVAL
         assert packet.uncertaintyFlags[-1].kind is UncertaintyKind.ANALYSIS_FAILED
 
+    def test_listProjectsAndEventPolling(self, api):
+        createDemo(api)
+        assert api.get("/projects", headers=AUTH).json() == {"projectIds": ["demo"]}
+        packetId = api.post("/projects/demo/trigger-audit", headers=AUTH).json()["packetId"]
+        waitForPending(api, packetId)
+        first = api.get(f"/packets/{packetId}/events", headers=AUTH).json()
+        assert first["events"][0]["kind"] == "stage" and first["next"] == len(first["events"])
+        assert api.get(f"/packets/{packetId}/events?after={first['next']}", headers=AUTH).json()["events"] == []
+        assert api.get(f"/packets/{packetId}/events?after=-1", headers=AUTH).status_code == 422
+
     def test_websocketRequiresTokenThenStreams(self, api):
         createDemo(api)
         packetId = api.post("/projects/demo/trigger-audit", headers=AUTH).json()["packetId"]

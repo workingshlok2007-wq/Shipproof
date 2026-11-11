@@ -201,6 +201,10 @@ def createApp(settings: Settings, toolboxFactory: ToolboxFactory = defaultToolbo
                           rulePages=tuple(body.rulePages), emailQuery=body.emailQuery)
         return store.createProject(project).model_dump(mode="json")
 
+    @app.get("/projects")
+    def listProjects(_: Actor = Depends(requireHuman)) -> dict[str, list[str]]:
+        return {"projectIds": store.listProjectIds()}
+
     @app.get("/projects/{projectId}")
     def getProject(projectId: str, _: Actor = Depends(requireHuman)) -> dict[str, Any]:
         return store.getProject(projectId).model_dump(mode="json")
@@ -290,6 +294,15 @@ def createApp(settings: Settings, toolboxFactory: ToolboxFactory = defaultToolbo
         summary = store.getSummary(packetId)
         return {"packet": store.getPacket(packetId).model_dump(mode="json"),
                 "summary": summary.model_dump(mode="json") if summary else None}
+
+    @app.get("/packets/{packetId}/events")
+    def packetEventHistory(packetId: str, after: int = 0, _: Actor = Depends(requireHuman)) -> dict[str, Any]:
+        """Polling fallback for clients whose proxy cannot carry WebSockets. Events are kept in memory only."""
+        if after < 0:
+            raise HTTPException(422, "after must be >= 0")
+        store.getPacket(packetId)
+        events = bus.history(packetId, after)
+        return {"events": events, "next": after + len(events)}
 
     def _requirePending(packetId: str) -> None:
         if store.getPacket(packetId).approvalState is not ApprovalState.PENDING_HUMAN_APPROVAL:
