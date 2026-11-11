@@ -23,14 +23,19 @@ class Echo(BaseModel):
 
 
 class FakeModels:
-    def __init__(self, response=None, error=None):
-        self.response, self.error, self.calls = response, error, []
+    def __init__(self, response=None, error=None, errorsByModel=None):
+        self.response, self.error, self.errorsByModel, self.calls = response, error, errorsByModel or {}, []
 
     def generate_content(self, **kwargs):
         self.calls.append(kwargs)
-        if self.error:
-            raise self.error
+        modelError = self.errorsByModel.get(kwargs["model"], self.error)
+        if modelError:
+            raise modelError
         return self.response
+
+
+def apiError(code):
+    return errors.APIError(code, {"error": {"message": f"status {code}", "status": "X"}})
 
 
 def fakeResponse(text='{"value": 1}', finishReason="FinishReason.STOP", candidates=True, blockReason=None):
@@ -41,15 +46,17 @@ def fakeResponse(text='{"value": 1}', finishReason="FinishReason.STOP", candidat
     )
 
 
-def makeClient(**fakeKwargs):
+def makeClient(config=None, **fakeKwargs):
     models = FakeModels(**fakeKwargs)
-    return GeminiClient(GeminiConfig(apiKey="test-key"), sdkClient=SimpleNamespace(models=models)), models
+    config = config or GeminiConfig(apiKey="test-key", model="primary", fallbackModels=("backup",))
+    return GeminiClient(config, sdkClient=SimpleNamespace(models=models)), models
 
 
 class TestConfig:
     @pytest.mark.parametrize("kwargs", [
         {"apiKey": ""}, {"apiKey": " k"}, {"apiKey": "k", "model": "../evil"},
         {"apiKey": "k", "timeoutSeconds": 1}, {"apiKey": "k", "maxAttempts": 0},
+        {"apiKey": "k", "fallbackModels": ("bad model",)}, {"apiKey": "k", "fallbackModels": ("a1", "a2", "a3", "a4")},
     ])
     def test_invalidConfig(self, kwargs):
         with pytest.raises(LlmConfigError):
@@ -62,6 +69,14 @@ class TestConfig:
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         with pytest.raises(LlmConfigError):
             GeminiConfig.fromEnvironment()
+
+    def test_fromEnvironmentFallbacks(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "k")
+        monkeypatch.setenv("GEMINI_MODEL", "primary")
+        monkeypatch.setenv("GEMINI_FALLBACK_MODELS", " backup , primary ,")
+        assert GeminiConfig.fromEnvironment().modelChain == ("primary", "backup")
+        monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "")
+        assert GeminiConfig.fromEnvironment().modelChain == ("primary",)
 
     def test_fromEnvironmentBadTimeout(self, monkeypatch):
         monkeypatch.setenv("GEMINI_API_KEY", "k")
@@ -87,9 +102,21 @@ class TestGeminiClient:
         with pytest.raises(LlmResponseError):
             client.generateJson("s", "u", {})
 
-    def test_apiErrorWrapped(self):
-        client, _ = makeClient(error=errors.APIError(429, {"error": {"message": "quota", "status": "RESOURCE_EXHAUSTED"}}))
-        with pytest.raises(LlmResponseError, match="429"):
+    @pytest.mark.parametrize("code", [404, 429, 503])
+    def test_fallbackOnOverload(self, code):
+        client, models = makeClient(response=fakeResponse(), errorsByModel={"primary": apiError(code)})
+        assert client.generateJson("s", "u", {}) == '{"value": 1}'
+        assert [c["model"] for c in models.calls] == ["primary", "backup"]
+
+    def test_noFallbackOnClientError(self):
+        client, models = makeClient(response=fakeResponse(), errorsByModel={"primary": apiError(400)})
+        with pytest.raises(LlmResponseError, match="primary: 400"):
+            client.generateJson("s", "u", {})
+        assert len(models.calls) == 1
+
+    def test_allModelsFailListsEach(self):
+        client, _ = makeClient(error=apiError(503))
+        with pytest.raises(LlmResponseError, match="primary: 503.*backup: 503"):
             client.generateJson("s", "u", {})
 
     def test_networkErrorWrapped(self):

@@ -15,6 +15,10 @@ from typing import Any, Optional, Protocol, TypeVar
 from pydantic import BaseModel, ValidationError
 
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_FALLBACK_MODELS = ("gemini-2.5-flash",)
+MAX_FALLBACK_MODELS = 3
+MAX_RETRY_DELAY_SECONDS = 8.0
+FALLBACK_STATUS_CODES = frozenset({404, 429, 500, 502, 503, 504})
 MAX_UNTRUSTED_CHARS = 200_000
 MAX_PROMPT_CHARS = 600_000
 MIN_TIMEOUT_SECONDS = 5
@@ -53,6 +57,7 @@ class LlmClient(Protocol):
 class GeminiConfig:
     apiKey: str = field(repr=False)
     model: str = DEFAULT_GEMINI_MODEL
+    fallbackModels: tuple[str, ...] = DEFAULT_FALLBACK_MODELS
     timeoutSeconds: int = 60
     maxAttempts: int = 3
 
@@ -61,6 +66,11 @@ class GeminiConfig:
             raise LlmConfigError("GEMINI_API_KEY is missing or has surrounding whitespace")
         if not _MODEL_PATTERN.match(self.model):
             raise LlmConfigError(f"invalid Gemini model id: {self.model!r}")
+        if len(self.fallbackModels) > MAX_FALLBACK_MODELS:
+            raise LlmConfigError(f"at most {MAX_FALLBACK_MODELS} fallback models")
+        for fallback in self.fallbackModels:
+            if not _MODEL_PATTERN.match(fallback):
+                raise LlmConfigError(f"invalid Gemini fallback model id: {fallback!r}")
         if not MIN_TIMEOUT_SECONDS <= self.timeoutSeconds <= MAX_TIMEOUT_SECONDS:
             raise LlmConfigError(f"timeoutSeconds must be in [{MIN_TIMEOUT_SECONDS}, {MAX_TIMEOUT_SECONDS}]")
         if not 1 <= self.maxAttempts <= MAX_ATTEMPTS:
@@ -70,15 +80,26 @@ class GeminiConfig:
     def fromEnvironment(cls) -> GeminiConfig:
         apiKey = os.environ.get("GEMINI_API_KEY", "")
         model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        rawFallbacks = os.environ.get("GEMINI_FALLBACK_MODELS")
+        fallbackModels = DEFAULT_FALLBACK_MODELS if rawFallbacks is None else tuple(m.strip() for m in rawFallbacks.split(",") if m.strip())
         try:
             timeoutSeconds = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "60"))
         except ValueError as error:
             raise LlmConfigError("GEMINI_TIMEOUT_SECONDS must be an integer") from error
-        return cls(apiKey=apiKey, model=model, timeoutSeconds=timeoutSeconds)
+        return cls(apiKey=apiKey, model=model, fallbackModels=fallbackModels, timeoutSeconds=timeoutSeconds)
+
+    @property
+    def modelChain(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((self.model, *self.fallbackModels)))
 
 
 class GeminiClient:
-    """Deterministic (temperature 0) JSON-mode calls. Retries 408/429/5xx via the SDK's bounded backoff."""
+    """Deterministic (temperature 0) JSON-mode calls.
+
+    Per model: SDK retries 408/429/5xx with backoff capped at MAX_RETRY_DELAY_SECONDS.
+    If a model stays overloaded, rate-limited or not found, the next model in modelChain is tried.
+    Any other error, or exhaustion of the chain, raises LlmResponseError listing every failure.
+    """
 
     def __init__(self, config: GeminiConfig, sdkClient: Optional[Any] = None) -> None:
         from google import genai
@@ -90,7 +111,7 @@ class GeminiClient:
             api_key=config.apiKey,
             http_options=types.HttpOptions(
                 timeout=config.timeoutSeconds * 1000,
-                retry_options=types.HttpRetryOptions(attempts=config.maxAttempts),
+                retry_options=types.HttpRetryOptions(attempts=config.maxAttempts, max_delay=MAX_RETRY_DELAY_SECONDS),
             ),
         )
 
@@ -99,9 +120,22 @@ class GeminiClient:
 
         if len(systemInstruction) + len(userContent) > MAX_PROMPT_CHARS:
             raise UntrustedInputError(f"prompt exceeds {MAX_PROMPT_CHARS} characters")
+        failures: list[str] = []
+        for model in self._config.modelChain:
+            try:
+                return self._generateWithModel(model, systemInstruction, userContent, responseSchema)
+            except errors.APIError as error:
+                failures.append(f"{model}: {error.code} {error.message}")
+                if error.code not in FALLBACK_STATUS_CODES:
+                    break
+        raise LlmResponseError("Gemini API error, all models failed: " + "; ".join(failures))
+
+    def _generateWithModel(self, model: str, systemInstruction: str, userContent: str, responseSchema: dict[str, Any]) -> str:
+        from google.genai import errors
+
         try:
             response = self._client.models.generate_content(
-                model=self._config.model,
+                model=model,
                 contents=userContent,
                 config=self._types.GenerateContentConfig(
                     system_instruction=systemInstruction,
@@ -110,8 +144,8 @@ class GeminiClient:
                     response_json_schema=responseSchema,
                 ),
             )
-        except errors.APIError as error:
-            raise LlmResponseError(f"Gemini API error {error.code}: {error.message}") from error
+        except errors.APIError:
+            raise
         except Exception as error:  # network, timeout, SDK errors: surface, never swallow
             raise LlmResponseError(f"Gemini request failed: {type(error).__name__}: {error}") from error
 
