@@ -1,4 +1,4 @@
-import type { AuditEvent, PacketView, Project, Remediation, SourceRef, SubmissionPacket } from "./types";
+import type { AuditEvent, Health, PacketView, Project, Remediation, SourceRef, SubmissionPacket } from "./types";
 
 const API_BASE = "/api";
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -66,9 +66,14 @@ const enc = encodeURIComponent;
 
 export function createClient() {
   return {
+    health: () => request<Health>("/health"),
+    answerQuestion: (packetId: string, questionId: string, value: string) =>
+      request<{ packetId: string; status: string }>(`/packets/${enc(packetId)}/answers`, "POST", { questionId, value }),
+    acceptRisk: (packetId: string, flagId: string, reason: string) =>
+      request<SubmissionPacket>(`/packets/${enc(packetId)}/flags/${enc(flagId)}/accept`, "POST", { reason }),
     listProjects: () => request<{ projectIds: string[] }>("/projects"),
     getProject: (projectId: string) => request<Project>(`/projects/${enc(projectId)}`),
-    createProject: (body: Omit<Project, "charter" | "proofChecks" | "workbenchChecks" | "packetIds">) =>
+    createProject: (body: Omit<Project, "charter" | "proofChecks" | "workbenchChecks" | "packetIds" | "memory">) =>
       request<Project>("/projects", "POST", body),
     addClause: (projectId: string, body: { clauseId: string; text: string; sourceRef: SourceRef }) =>
       request<Project>(`/projects/${enc(projectId)}/clauses`, "POST", body),

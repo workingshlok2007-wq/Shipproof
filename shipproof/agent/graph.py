@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -223,10 +224,25 @@ def _deadlineCandidates(state: AuditState) -> list[tuple[datetime, GroundedRule,
     return sorted(best.values(), key=lambda item: item[0])
 
 
+VIDEO_SITES = frozenset({"youtube.com", "youtu.be", "vimeo.com", "loom.com", "google.com", "dropbox.com", "streamable.com"})
+_PATH_WORD = re.compile(r"[a-z]{3,}")
+_GENERIC_WORDS = frozenset({"html", "htm", "php", "index", "www", "http", "https", "com"})
+
+
 def _site(url: str) -> str:
     host = (urlsplit(url).hostname or "").lower()
     labels = host.split(".")
     return ".".join(labels[-2:]) if len(labels) >= 2 else host
+
+
+def isLikelyAlternative(original: str, candidate: str) -> bool:
+    """Same site, and either a video host or a shared meaningful path word (video-private vs video-public)."""
+    if candidate == original or _site(candidate) != _site(original):
+        return False
+    if _site(original) in VIDEO_SITES:
+        return True
+    words = lambda url: set(_PATH_WORD.findall(urlsplit(url).path.lower())) - _GENERIC_WORDS  # noqa: E731
+    return bool(words(original) & words(candidate))
 
 
 def _sourceLocation(state: AuditState, sourceId: str) -> str:
@@ -561,7 +577,7 @@ def buildAuditGraph(deps: AuditDependencies) -> Any:
                                            "Re-check a failed submission link.", "passed on re-check; flag cleared (earlier failure was transient)")
                 continue
             note = f"Re-checked: still failing ({retry.detail})."
-            alternatives = [c for c in dict.fromkeys(merged["candidateLinks"]) if c != link.url and c not in visited and _site(c) == _site(link.url)]
+            alternatives = [c for c in dict.fromkeys(merged["candidateLinks"]) if c not in visited and isLikelyAlternative(link.url, c)]
             found = False
             for alternative in alternatives[:MAX_ALTERNATIVE_CHECKS]:
                 visited.add(alternative)

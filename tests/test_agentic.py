@@ -215,7 +215,7 @@ def scenarioTools(videoPublicOnRetry=False, alternative=None):
 
 def scenarioProject(memory=ProjectMemory()):
     return Project(projectId="demo", repo="acme/app", proposalText=PROPOSAL, rulePages=(RULES_URL,),
-                   links=(LinkTarget(label="Demo video", url="https://video.example/v1"),), memory=memory)
+                   links=(LinkTarget(label="Demo video", url="https://youtu.be/v1"),), memory=memory)
 
 
 def scenarioDeps(tools=None, llm=None, checkpointer=None, events=None, previous=None, budget=90):
@@ -274,7 +274,7 @@ class TestScenario:
                      resume={"value": "unsure", "actor": {"actorId": "bot", "kind": "AGENT", "role": None}})
 
     def test_reflectRetriesAndFindsAlternative(self):
-        alternative = "https://video.example/v2"
+        alternative = "https://youtu.be/v2"
         done = runAudit(scenarioProject(), "pkt-1", scenarioDeps(tools=scenarioTools(alternative=alternative), llm=ScenarioLlm(investigate=False)), utcNow())
         flag = next(f for f in done.packet.uncertaintyFlags if "link1" in f.sourceIds)
         assert flag.severity is Severity.CRITICAL and "Re-checked: still failing" in flag.followUp and alternative in flag.followUp
@@ -292,12 +292,19 @@ class TestScenario:
         assert done.summary.budgetExhausted
 
     def test_diffAgainstPreviousAudit(self):
-        first = runAudit(scenarioProject(), "pkt-1", scenarioDeps(tools=scenarioTools(alternative="https://video.example/v2"), llm=ScenarioLlm(investigate=False)), utcNow())
+        first = runAudit(scenarioProject(), "pkt-1", scenarioDeps(tools=scenarioTools(alternative="https://youtu.be/v2"), llm=ScenarioLlm(investigate=False)), utcNow())
         second = runAudit(scenarioProject(), "pkt-2", scenarioDeps(tools=scenarioTools(videoPublicOnRetry=True), llm=ScenarioLlm(investigate=False),
                                                                     previous=first.packet), utcNow())
         assert second.summary.diff.previousPacketId == "pkt-1"
         assert any("link1" in label for label in second.summary.diff.fixedEvidence)
         assert any("login wall" in detail for detail in second.summary.diff.resolvedFlags)
+
+    def test_alternativeHeuristic(self):
+        from shipproof.agent.graph import isLikelyAlternative
+        assert isLikelyAlternative("http://127.0.0.1:8799/video-private.html", "http://127.0.0.1:8799/video-public.html")
+        assert not isLikelyAlternative("http://127.0.0.1:8799/video-private.html", "http://127.0.0.1:8799/faq.html")
+        assert isLikelyAlternative("https://youtu.be/abc", "https://youtu.be/xyz")
+        assert not isLikelyAlternative("https://youtu.be/abc", "https://vimeo.com/1")
 
     def test_flagKeyStableAcrossTimestamps(self):
         a = flagKey(UncertaintyKind.UNDATED_RULE, "Deadline at 2026-11-12T18:00:00+00:00 is undated")
@@ -318,7 +325,7 @@ def agenticApi(tmp_path):
                     toolboxFactory=toolbox, llmFactory=lambda: (ScenarioLlm(), None))
     with TestClient(app) as client:
         client.post("/projects", json={"projectId": "demo", "repo": "acme/app", "proposalText": PROPOSAL, "rulePages": [RULES_URL],
-                                       "links": [{"label": "Demo video", "url": "https://video.example/v1"}]}, headers=AUTH)
+                                       "links": [{"label": "Demo video", "url": "https://youtu.be/v1"}]}, headers=AUTH)
         yield client
 
 

@@ -2,13 +2,14 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { ApiClient } from "@/lib/api";
-import type { AuditEvent, PacketView, Remediation, Severity, SubmissionPacket } from "@/lib/types";
+import type { AuditEvent, PacketView, Remediation, Severity, SubmissionPacket, UncertaintyFlag } from "@/lib/types";
 import type { StreamMode } from "@/lib/useAuditStream";
 import { Button, Card, Empty, ErrorNote, SafeLink, SeverityBadge, StatusBadge, formatTime } from "./ui";
+import { AgentTrace, DiffCard, QuestionCard } from "./AgentPanels";
 import { RemediationPanel } from "./RemediationPanel";
 import { useAction } from "./useAction";
 
-const STAGES = ["queued", "ingest", "extract", "reconcile", "plan", "audit", "remediate", "finalize"] as const;
+const STAGES = ["queued", "ingest", "extract", "reconcile", "plan", "audit", "investigate", "reflect", "remediate", "finalize"] as const;
 const SEVERITY_ORDER: Record<Severity, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
 
 function StageTimeline({ events, finished, halted }: { events: AuditEvent[]; finished: boolean; halted: boolean }) {
@@ -17,7 +18,7 @@ function StageTimeline({ events, finished, halted }: { events: AuditEvent[]; fin
   return (
     <ol className="flex flex-wrap items-center gap-2" aria-label="Audit stages">
       {STAGES.map((stage) => {
-        const skipped = halted && (stage === "plan" || stage === "audit" || stage === "remediate");
+        const skipped = halted && ["plan", "audit", "investigate", "reflect", "remediate"].includes(stage);
         const done = (reached.has(stage) && (stage !== current || finished)) || (finished && !skipped && reached.has(stage));
         const active = stage === current && !finished;
         return (
@@ -57,21 +58,53 @@ function approvalBlockers(packet: SubmissionPacket): string[] {
   if (!packet.ledger.humanConfirmedComplete) blockers.push("Coverage ledger not confirmed complete.");
   if (packet.proofChecks.some((c) => c.status === "STALE")) blockers.push("STALE proof checks need re-confirmation.");
   if (packet.proofChecks.some((c) => c.promotedBy && c.status === "FAIL")) blockers.push("A promoted proof check reports a possible misreading.");
-  const critical = packet.uncertaintyFlags.filter((f) => f.severity === "CRITICAL").length;
-  if (critical) blockers.push(`${critical} CRITICAL flag(s) open.`);
+  const critical = packet.uncertaintyFlags.filter((f) => f.severity === "CRITICAL" && !f.acceptedBy).length;
+  if (critical) blockers.push(`${critical} CRITICAL flag(s) not accepted.`);
   return blockers;
 }
 
-export function AuditView({ client, view, events, streamMode, streamError, onPacket, onRemediation }: {
+function FlagItem({ flag, canAccept, onAccept, busy }: {
+  flag: UncertaintyFlag; canAccept: boolean; onAccept: (reason: string) => void; busy: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  return (
+    <li className={`clay-inset p-3 ${flag.acceptedBy ? "opacity-75" : ""}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <SeverityBadge severity={flag.severity} />
+        <span className="font-mono text-[11px] text-muted">{flag.kind}</span>
+        {flag.acceptedBy && <span className="rounded-full bg-pass/12 px-2 py-0.5 text-[10px] font-semibold text-pass">ACCEPTED</span>}
+      </div>
+      <p className="mt-1.5 whitespace-pre-wrap break-words text-sm">{flag.detail}</p>
+      {flag.followUp && <p className="mt-1.5 border-l-2 border-stale/50 pl-2 text-xs"><span className="font-semibold">Agent follow-up:</span> {flag.followUp}</p>}
+      {flag.acceptedReason && <p className="mt-1.5 text-xs text-pass">Risk accepted by {flag.acceptedBy?.actorId}: {flag.acceptedReason}</p>}
+      {canAccept && !flag.acceptedBy && flag.severity === "CRITICAL" && (
+        open ? (
+          <div className="mt-2 flex flex-wrap gap-2">
+            <input className="field min-w-0 flex-1" maxLength={500} placeholder="Why is this risk acceptable?" value={reason}
+                   onChange={(e) => setReason(e.target.value)} />
+            <Button variant="danger" disabled={busy || !reason.trim()} onClick={() => onAccept(reason.trim())}>Accept risk</Button>
+            <Button onClick={() => setOpen(false)}>Cancel</Button>
+          </div>
+        ) : <button type="button" className="mt-2 text-xs font-medium text-fail underline-offset-2 hover:underline" onClick={() => setOpen(true)}>Accept this risk with a reason…</button>
+      )}
+    </li>
+  );
+}
+
+export function AuditView({ client, view, events, streamMode, streamError, onPacket, onRemediation, onRefresh }: {
   client: ApiClient; view: PacketView; events: AuditEvent[]; streamMode: StreamMode; streamError: string | null;
-  onPacket: (packet: SubmissionPacket) => void; onRemediation: (remediation: Remediation) => void;
+  onPacket: (packet: SubmissionPacket) => void; onRemediation: (remediation: Remediation) => void; onRefresh: () => void;
 }) {
   const { packet, summary } = view;
   const { busy, error, run } = useAction();
   const [reviewed, setReviewed] = useState(false);
   useEffect(() => setReviewed(false), [packet.packetId]);
 
-  const auditing = packet.approvalState === "AUDITING";
+  const awaiting = packet.approvalState === "AWAITING_INPUT";
+  const auditing = packet.approvalState === "AUDITING" || awaiting;
+  const pendingQuestion = summary?.questions.find((q) => q.answer === null) ?? null;
+  const deadlineAnswer = summary?.questions.find((q) => q.kind === "DEADLINE_CHOICE" && q.answer && q.answer.value !== "unsure") ?? null;
   const liveConfusion = [...events].reverse().find((e) => e.kind === "confusion")?.data;
   const confusionIndex = summary?.confusionIndex ?? (typeof liveConfusion?.index === "number" ? liveConfusion.index : 0);
   const threshold = summary?.confusionThreshold ?? (typeof liveConfusion?.threshold === "number" ? liveConfusion.threshold : 15);
@@ -91,13 +124,16 @@ export function AuditView({ client, view, events, streamMode, streamError, onPac
       <Card title={`Audit ${packet.packetId}`} subtitle={summary ? `Started ${formatTime(summary.startedAt)} · finished ${formatTime(summary.finishedAt)}` : "Running"}
             action={<span className="text-[11px] text-muted">stream: {streamMode}</span>}>
         <StageTimeline events={events} finished={!auditing} halted={halted} />
+        {awaiting && <p className="mt-3 text-sm font-medium text-accent-deep">Paused: waiting for your answer below.</p>}
         <ErrorNote message={streamError} />
         <div className="mt-6 grid gap-6 lg:grid-cols-2">
           <ConfusionMeter index={confusionIndex} threshold={threshold} halted={halted} />
           <div>
             <p className="text-xs font-medium text-muted">Effective deadline</p>
             <p className="mt-1 text-lg font-semibold">{summary?.effectiveDeadline ? formatTime(summary.effectiveDeadline) : "Unresolved"}</p>
-            <p className="text-[11px] text-muted">Resolved by recency only when every competing rule is dated.</p>
+            <p className="text-[11px] text-muted">{deadlineAnswer
+              ? `Set by ${deadlineAnswer.answeredFromMemory ? "your earlier answer (from memory)" : "your answer"}.`
+              : "Resolved by recency only when every competing rule is dated."}</p>
           </div>
         </div>
         {summary && summary.plan.length > 0 && (
@@ -116,18 +152,22 @@ export function AuditView({ client, view, events, streamMode, streamError, onPac
         )}
       </Card>
 
+      {awaiting && pendingQuestion && (
+        <QuestionCard client={client} packetId={packet.packetId} question={pendingQuestion} onAnswered={onRefresh} />
+      )}
+
+      {summary && (
+        <AgentTrace steps={summary.agentSteps} model={summary.llmModel} budgetSeconds={summary.budgetSeconds} budgetExhausted={summary.budgetExhausted} />
+      )}
+      <DiffCard diff={summary?.diff ?? null} />
+
       <div className="grid gap-6 xl:grid-cols-2">
-        <Card title="Uncertainty flags" subtitle="What the agent could not confirm. CRITICAL flags block approval.">
+        <Card title="Uncertainty flags" subtitle="What the agent could not confirm. CRITICAL flags block approval unless you accept them with a reason.">
           {flags.length === 0 ? <Empty>{auditing ? "Waiting for the audit." : "No flags raised."}</Empty> : (
             <ul className="space-y-2">
               {flags.map((flag) => (
-                <li key={flag.flagId} className="clay-inset p-3">
-                  <div className="flex items-center gap-2">
-                    <SeverityBadge severity={flag.severity} />
-                    <span className="font-mono text-[11px] text-muted">{flag.kind}</span>
-                  </div>
-                  <p className="mt-1.5 whitespace-pre-wrap break-words text-sm">{flag.detail}</p>
-                </li>
+                <FlagItem key={flag.flagId} flag={flag} busy={busy} canAccept={packet.approvalState === "PENDING_HUMAN_APPROVAL"}
+                          onAccept={(reason) => act(() => client.acceptRisk(packet.packetId, flag.flagId, reason))} />
               ))}
             </ul>
           )}

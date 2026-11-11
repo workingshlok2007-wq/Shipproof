@@ -7,11 +7,12 @@ import { TierBoard } from "@/components/TierBoard";
 import { Button, Card, Empty, ErrorNote, SafeLink } from "@/components/ui";
 import { useAction } from "@/components/useAction";
 import { createClient } from "@/lib/api";
-import type { PacketView, Project } from "@/lib/types";
+import type { Health, PacketView, Project } from "@/lib/types";
 import { useAuditStream } from "@/lib/useAuditStream";
 
 const PACKET_REFRESH_MS = 2000;
-const REFRESH_KINDS = new Set(["evidence", "flag", "alignment", "proofCheck", "plan", "done", "decision"]);
+const REFRESH_KINDS = new Set(["evidence", "flag", "alignment", "proofCheck", "plan", "done", "decision", "paused", "agentStep",
+  "questionAnswered", "riskAccepted", "remediation"]);
 
 export default function Home() {
   const [projectIds, setProjectIds] = useState<string[]>([]);
@@ -23,6 +24,24 @@ export default function Home() {
 
   const [client] = useState(createClient);
   const stream = useAuditStream(client, packetId);
+  const [health, setHealth] = useState<Health | null>(null);
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const next = await client.health();
+        if (cancelled) return;
+        setHealth(next);
+        if (next.llm.status === "starting") timer = setTimeout(load, 3000);
+      } catch {
+        if (!cancelled) timer = setTimeout(load, 5000); // engine not up yet; the page-level error explains it
+      }
+    };
+    void load();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [client]);
 
   useEffect(() => {
     void run(async () => {
@@ -84,6 +103,17 @@ export default function Home() {
           <p className="text-sm text-muted">Evidence ledger and human approval boundary. The agent prepares; you decide.</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          {health && (
+            <span title={health.llm.reason ?? health.llm.chain?.join(" → ") ?? ""}
+                  className={`max-w-xs truncate rounded-full px-3 py-1 text-[11px] font-semibold ${
+                    health.llmMode === "replay" || health.llm.status === "ready" || health.llm.status === "injected" ? "bg-pass/12 text-pass"
+                      : health.llm.status === "starting" ? "bg-stale/15 text-stale" : "bg-fail/10 text-fail"}`}>
+              {health.llmMode === "replay" ? "Model: replaying saved answers"
+                : health.llm.status === "ready" ? `Model: ${health.llm.model}${health.llmMode === "record" ? " (recording)" : ""}`
+                : health.llm.status === "starting" ? "Model: checking…" : health.llm.status === "injected" ? "Model: test" : "Model unavailable"}
+              {health.demo ? " · demo" : ""}
+            </span>
+          )}
           <select className="field w-48" aria-label="Project" value={project?.projectId ?? ""} onChange={(e) => e.target.value && openProject(e.target.value)}>
             <option value="">Select project</option>
             {projectIds.map((id) => <option key={id} value={id}>{id}</option>)}
@@ -105,7 +135,7 @@ export default function Home() {
       {project && (
         <>
           <Card title={project.projectId} subtitle="Audit target"
-                action={<Button variant="primary" disabled={busy || view?.packet.approvalState === "AUDITING"} onClick={triggerAudit}>Run audit</Button>}>
+                action={<Button variant="primary" disabled={busy || view?.packet.approvalState === "AUDITING" || view?.packet.approvalState === "AWAITING_INPUT"} onClick={triggerAudit}>Run audit</Button>}>
             <div className="grid gap-4 text-sm md:grid-cols-3">
               <div>
                 <p className="text-xs font-medium text-muted">Repository</p>
@@ -137,6 +167,7 @@ export default function Home() {
           {view ? (
             <AuditView client={client} view={view} events={stream.events} streamMode={stream.mode} streamError={stream.error}
                        onPacket={(packet) => setView({ packet, summary: view.summary })}
+                       onRefresh={() => void refreshPacket()}
                        onRemediation={(updated) => setView({ ...view, summary: view.summary && {
                          ...view.summary,
                          remediations: view.summary.remediations.map((r) => r.remediationId === updated.remediationId ? updated : r),
