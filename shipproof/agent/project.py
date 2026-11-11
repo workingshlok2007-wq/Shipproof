@@ -20,6 +20,7 @@ from shipproof.models import (
     UncertaintyFlag,
     WorkbenchCheck,
 )
+from shipproof.agent.memory import AgentQuestion, AgentStep, AuditDiff, ProjectMemory
 from shipproof.prompts import GroundedRule
 from shipproof.remediation import Remediation
 
@@ -43,6 +44,7 @@ class Project(FrozenModel):
     proofChecks: Annotated[tuple[ProofCheck, ...], Field(max_length=MAX_COLLECTION)] = ()
     workbenchChecks: Annotated[tuple[WorkbenchCheck, ...], Field(max_length=MAX_COLLECTION)] = ()
     packetIds: Annotated[tuple[EntityId, ...], Field(max_length=MAX_COLLECTION)] = ()
+    memory: ProjectMemory = ProjectMemory()
 
 
 class PlannedTask(FrozenModel):
@@ -66,6 +68,12 @@ class AuditSummary(FrozenModel):
     halted: bool = False
     error: Optional[ShortText] = None
     remediations: tuple[Remediation, ...] = ()
+    agentSteps: tuple[AgentStep, ...] = ()
+    questions: tuple[AgentQuestion, ...] = ()
+    diff: Optional[AuditDiff] = None
+    llmModel: Optional[ShortText] = None
+    budgetSeconds: Annotated[int, Field(ge=1, le=3600)] = 90
+    budgetExhausted: bool = False
 
 
 SEVERITY_WEIGHT: dict[Severity, int] = {Severity.LOW: 1, Severity.MEDIUM: 3, Severity.HIGH: 6, Severity.CRITICAL: 10}

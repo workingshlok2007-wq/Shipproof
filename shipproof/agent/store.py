@@ -11,12 +11,15 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from shipproof.agent.memory import AcceptedRisk, HumanDecision, flagKey
 from shipproof.agent.project import AuditSummary, Project
 from shipproof.remediation import Remediation, RemediationStatus
 from shipproof.models import (
     AGENT_ACTOR,
+    Actor,
     ApprovalState,
     CoverageLedger,
+    acceptFlag,
     ModelError,
     ProofCheck,
     Severity,
@@ -64,7 +67,7 @@ class ProjectStore:
         except (OSError, ValueError) as error:
             raise StoreError(f"cannot load data file {dataFile}: {error}") from error
         for packetId, packet in list(self._packets.items()):
-            if packet.approvalState is ApprovalState.AUDITING:  # audit was interrupted by a restart
+            if packet.approvalState in (ApprovalState.AUDITING, ApprovalState.AWAITING_INPUT):  # interrupted by a restart
                 self._packets[packetId] = self._failedPacket(packet, "Server restarted during the audit.")
 
     def _save(self) -> None:
@@ -188,12 +191,72 @@ class ProjectStore:
             self._save()
             return project, packetId
 
+    def previousPacket(self, projectId: str, packetId: str) -> Optional[SubmissionPacket]:
+        """Latest finished audit before this one, for the audit-to-audit diff."""
+        with self._lock:
+            ids = self.getProject(projectId).packetIds
+            earlier = ids[:ids.index(packetId)] if packetId in ids else ids
+            for candidate in reversed(earlier):
+                packet = self._packets.get(candidate)
+                if packet is not None and packet.approvalState not in (ApprovalState.AUDITING, ApprovalState.AWAITING_INPUT, ApprovalState.DRAFT):
+                    return packet
+            return None
+
+    def pauseAudit(self, packetId: str, summary: AuditSummary) -> SubmissionPacket:
+        """The agent asked a question: the project stays locked to this audit until a human answers."""
+        with self._lock:
+            paused = transitionPacket(self.getPacket(packetId), ApprovalState.AWAITING_INPUT, AGENT_ACTOR)
+            self._packets[packetId] = paused
+            self._summaries[packetId] = summary
+            self._save()
+            return paused
+
+    def resumeAudit(self, packetId: str, questionId: str, value: str, actor: Actor) -> AuditSummary:
+        """Validates the answer against the pending question, then moves the packet back to AUDITING."""
+        with self._lock:
+            packet = self.getPacket(packetId)
+            if packet.approvalState is not ApprovalState.AWAITING_INPUT:
+                raise ConflictError("this audit is not waiting for an answer")
+            summary = self.getSummary(packetId)
+            pending = [q for q in (summary.questions if summary else ()) if q.answer is None]
+            if not pending or pending[-1].questionId != questionId:
+                raise ConflictError("that question is not the one awaiting an answer")
+            try:
+                pending[-1].option(value)
+            except ValueError as error:
+                raise ConflictError(str(error)) from error
+            self._packets[packetId] = transitionPacket(packet, ApprovalState.AUDITING, actor)
+            self._save()
+            return summary  # type: ignore[return-value]
+
+    def acceptRisk(self, packetId: str, flagId: str, actor: Actor, reason: str) -> SubmissionPacket:
+        """Accepts one flag on this packet and remembers it for future audits of the project."""
+        with self._lock:
+            summary = self.getSummary(packetId)
+            if summary is None:
+                raise NotFoundError(f"no audit summary for {packetId}")
+            updated = acceptFlag(self.getPacket(packetId), flagId, actor, reason)
+            flag = next(f for f in updated.uncertaintyFlags if f.flagId == flagId)
+            project = self.getProject(summary.projectId)
+            risk = AcceptedRisk(flagKey=flagKey(flag.kind, flag.detail), kind=flag.kind, detail=flag.detail,
+                                reason=reason.strip(), acceptedBy=actor, acceptedAt=utcNow())
+            self._projects[project.projectId] = project.model_copy(update={"memory": project.memory.withAcceptedRisk(risk)})
+            self._packets[packetId] = updated
+            self._save()
+            return updated
+
     def completeAudit(self, projectId: str, packet: SubmissionPacket, summary: AuditSummary,
-                      auditedChecks: tuple[ProofCheck, ...], snapshot: tuple[ProofCheck, ...]) -> None:
-        """Writes refreshed proof statuses back only for checks the human did not change during the audit."""
+                      auditedChecks: tuple[ProofCheck, ...], snapshot: tuple[ProofCheck, ...],
+                      decisions: tuple[HumanDecision, ...] = ()) -> None:
+        """Writes refreshed proof statuses back only for checks the human did not change during the audit,
+        and stores the human's answers in project memory."""
         with self._lock:
             try:
                 project = self.getProject(projectId)
+                memory = project.memory
+                for decision in decisions:
+                    memory = memory.withDecision(decision)
+                project = project.model_copy(update={"memory": memory})
                 unchanged = {c.checkId: c for c in snapshot}
                 refreshed = {c.checkId: c for c in auditedChecks}
                 merged = tuple(
@@ -220,11 +283,14 @@ class ProjectStore:
     @staticmethod
     def _failedPacket(packet: SubmissionPacket, reason: str) -> SubmissionPacket:
         """A failed audit still ends at the human boundary, carrying a CRITICAL flag that blocks approval."""
-        flag = UncertaintyFlag(flagId=f"f{len(packet.uncertaintyFlags) + 1}", kind=UncertaintyKind.ANALYSIS_FAILED,
+        nextId = max((int(f.flagId[1:]) for f in packet.uncertaintyFlags if f.flagId[1:].isdigit()), default=0) + 1
+        flag = UncertaintyFlag(flagId=f"f{nextId}", kind=UncertaintyKind.ANALYSIS_FAILED,
                                detail=f"Audit did not complete: {reason}"[:512], severity=Severity.CRITICAL, raisedAt=utcNow())
         updated = packet.model_validate({**packet.model_dump(), "uncertaintyFlags": [*packet.uncertaintyFlags, flag],
                                          "ledger": CoverageLedger(sources=packet.ledger.sources)})
         if updated.approvalState is ApprovalState.AUDITING:
+            updated = transitionPacket(updated, ApprovalState.PENDING_HUMAN_APPROVAL, AGENT_ACTOR)
+        elif updated.approvalState is ApprovalState.AWAITING_INPUT:
             updated = transitionPacket(updated, ApprovalState.PENDING_HUMAN_APPROVAL, AGENT_ACTOR)
         return updated
 

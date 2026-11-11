@@ -17,7 +17,17 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from shipproof.models import CheckStatus, EntityId, EvidenceItem, EvidenceMethod, utcNow
+from urllib.parse import urlsplit as _split
+
 from shipproof.tools.netGuard import UnsafeUrlError, assertPublicUrl, isPublicUrl
+
+
+def _origin(url: str) -> str:
+    try:
+        parts = _split(url)
+        return f"{parts.scheme}://{parts.netloc}".lower()
+    except ValueError:
+        return ""
 
 DEFAULT_TIMEOUT_MS = 20_000
 SETTLE_TIMEOUT_MS = 4_000
@@ -53,6 +63,10 @@ class RenderedPage:
     authWallDetected: bool
     authWallReasons: tuple[str, ...]
     unavailableReasons: tuple[str, ...]
+    links: tuple[str, ...] = ()
+
+
+MAX_PAGE_LINKS = 100
 
 
 def detectUnavailable(pageText: str) -> tuple[str, ...]:
@@ -77,14 +91,19 @@ class LinkAuditor:
     """Context manager owning one browser. Each URL gets an isolated context with no cookies or storage."""
 
     def __init__(self, allowPrivateNetwork: bool = False, timeoutMs: int = DEFAULT_TIMEOUT_MS,
+                 allowedOrigins: tuple[str, ...] = (),
                  executablePath: Optional[str] = None) -> None:
         if not 1_000 <= timeoutMs <= 120_000:
             raise LinkAuditError("timeoutMs must be in [1000, 120000]")
         self._allowPrivateNetwork = allowPrivateNetwork
+        self._allowedOrigins = frozenset(o.lower().rstrip("/") for o in allowedOrigins)  # exact origins only (demo fixtures)
         self._timeoutMs = timeoutMs
         self._executablePath = executablePath or os.environ.get("SHIPPROOF_CHROMIUM_PATH") or None
         self._playwright = None
         self._browser = None
+
+    def _permitted(self, url: str) -> bool:
+        return _origin(url) in self._allowedOrigins or isPublicUrl(url, self._allowPrivateNetwork)
 
     def __enter__(self) -> LinkAuditor:
         try:
@@ -113,12 +132,13 @@ class LinkAuditor:
 
         if self._browser is None:
             raise LinkAuditError("LinkAuditor used outside its context manager")
-        assertPublicUrl(url, self._allowPrivateNetwork)
+        if _origin(url) not in self._allowedOrigins:
+            assertPublicUrl(url, self._allowPrivateNetwork)
         context = self._browser.new_context(locale="en-US", java_script_enabled=True, accept_downloads=False,
                                             service_workers="block")
         try:
             context.route("**/*", lambda route: route.continue_()
-                          if isPublicUrl(route.request.url, self._allowPrivateNetwork) or route.request.url.startswith(("data:", "blob:"))
+                          if self._permitted(route.request.url) or route.request.url.startswith(("data:", "blob:"))
                           else route.abort("blockedbyclient"))
             page = context.new_page()
             page.set_default_timeout(self._timeoutMs)
@@ -131,9 +151,11 @@ class LinkAuditor:
             except PlaywrightTimeout:
                 pass  # Best-effort settle for single-page apps; streaming sites never go idle. Content is read regardless.
             finalUrl = page.url
-            if not isPublicUrl(finalUrl, self._allowPrivateNetwork):
+            if not self._permitted(finalUrl):
                 raise UnsafeUrlError(f"redirected to non-public target {finalUrl[:200]}")
             fullText = page.inner_text("body") if page.locator("body").count() else ""
+            hrefs = page.eval_on_selector_all("a[href]", "els => els.slice(0, 500).map(e => e.href)")
+            links = tuple(dict.fromkeys(h for h in hrefs if isinstance(h, str) and h.startswith(("http://", "https://")) and len(h) <= 2000))[:MAX_PAGE_LINKS]
             hasPasswordField = page.locator("input[type=password]").count() > 0
         finally:
             context.close()
@@ -144,7 +166,7 @@ class LinkAuditor:
             requestedUrl=url, finalUrl=finalUrl, finalStatus=response.status if response is not None else None,
             text=text, textTruncated=len(fullText) > MAX_PAGE_TEXT_CHARS,
             contentSha256=hashlib.sha256(fullText.encode("utf-8")).hexdigest(),
-            authWallDetected=bool(reasons), authWallReasons=reasons, unavailableReasons=detectUnavailable(text),
+            authWallDetected=bool(reasons), authWallReasons=reasons, unavailableReasons=detectUnavailable(text), links=links,
         )
 
     def audit(self, url: str, evidenceId: EntityId) -> EvidenceItem:

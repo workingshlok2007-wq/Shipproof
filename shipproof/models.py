@@ -118,6 +118,7 @@ class CheckStatus(str, Enum):
 class ApprovalState(str, Enum):
     DRAFT = "DRAFT"
     AUDITING = "AUDITING"
+    AWAITING_INPUT = "AWAITING_INPUT"
     PENDING_HUMAN_APPROVAL = "PENDING_HUMAN_APPROVAL"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
@@ -408,6 +409,27 @@ class UncertaintyFlag(FrozenModel):
     severity: Severity
     sourceIds: Annotated[tuple[EntityId, ...], Field(max_length=MAX_COLLECTION)] = ()
     raisedAt: AwareDatetime
+    followUp: Optional[LongText] = None
+    acceptedReason: Optional[ShortText] = None
+    acceptedBy: Optional[Actor] = None
+    acceptedAt: Optional[AwareDatetime] = None
+
+    @model_validator(mode="after")
+    def _acceptanceConsistent(self) -> UncertaintyFlag:
+        fields = (self.acceptedReason, self.acceptedBy, self.acceptedAt)
+        if any(f is not None for f in fields) and not all(f is not None for f in fields):
+            raise ValueError("acceptedReason, acceptedBy and acceptedAt must be set together")
+        if self.acceptedBy is not None and not self.acceptedBy.isHuman:
+            raise ValueError("only a human may accept a risk")
+        return self
+
+    @property
+    def isAccepted(self) -> bool:
+        return self.acceptedBy is not None
+
+    @property
+    def blocksApproval(self) -> bool:
+        return self.severity is Severity.CRITICAL and not self.isAccepted
 
 
 class CoverageLedger(FrozenModel):
@@ -487,12 +509,14 @@ class AlignmentReport(FrozenModel):
 
 ALLOWED_TRANSITIONS: dict[ApprovalState, frozenset[ApprovalState]] = {
     ApprovalState.DRAFT: frozenset({ApprovalState.AUDITING}),
-    ApprovalState.AUDITING: frozenset({ApprovalState.PENDING_HUMAN_APPROVAL}),
+    ApprovalState.AUDITING: frozenset({ApprovalState.PENDING_HUMAN_APPROVAL, ApprovalState.AWAITING_INPUT}),
+    ApprovalState.AWAITING_INPUT: frozenset({ApprovalState.AUDITING, ApprovalState.PENDING_HUMAN_APPROVAL}),
     ApprovalState.PENDING_HUMAN_APPROVAL: frozenset({ApprovalState.APPROVED, ApprovalState.REJECTED}),
     ApprovalState.APPROVED: frozenset(),
     ApprovalState.REJECTED: frozenset(),
 }
 HUMAN_ONLY_STATES = frozenset({ApprovalState.APPROVED, ApprovalState.REJECTED})
+MAX_ACCEPT_REASON_CHARS = 500
 
 
 class SubmissionPacket(FrozenModel):
@@ -538,8 +562,8 @@ class SubmissionPacket(FrozenModel):
                 raise ValueError("APPROVED blocked: STALE proof checks require reconfirmation")
             if any(c.status is CheckStatus.FAIL for c in self.gatingChecks):
                 raise ValueError("APPROVED blocked: promoted proof check has FAIL status")
-            if any(f.severity is Severity.CRITICAL for f in self.uncertaintyFlags):
-                raise ValueError("APPROVED blocked: open CRITICAL uncertainty flag")
+            if any(f.blocksApproval for f in self.uncertaintyFlags):
+                raise ValueError("APPROVED blocked: CRITICAL uncertainty flag not accepted")
         return self
 
     @property
@@ -551,8 +575,29 @@ class SubmissionPacket(FrozenModel):
 def transitionPacket(packet: SubmissionPacket, target: ApprovalState, actor: Actor) -> SubmissionPacket:
     if target not in ALLOWED_TRANSITIONS[packet.approvalState]:
         raise ModelError(f"illegal transition {packet.approvalState.value} -> {target.value}")
+    if packet.approvalState is ApprovalState.AWAITING_INPUT and target is ApprovalState.AUDITING and not actor.isHuman:
+        raise ModelError("only a human answer can resume an audit")
     if target in HUMAN_ONLY_STATES:
         if not actor.isHuman:
             raise ModelError(f"only a human actor may set {target.value}")
         return packet.model_validate({**packet.model_dump(), "approvalState": target, "decidedBy": actor, "decidedAt": utcNow()})
     return packet.model_validate({**packet.model_dump(), "approvalState": target})
+
+
+def acceptFlag(packet: SubmissionPacket, flagId: str, actor: Actor, reason: str) -> SubmissionPacket:
+    """A human explicitly accepts a risk with a written reason. Recorded, never silent; only while awaiting approval."""
+    if packet.approvalState is not ApprovalState.PENDING_HUMAN_APPROVAL:
+        raise ModelError("risks can only be accepted while the packet awaits approval")
+    if not actor.isHuman:
+        raise ModelError("only a human may accept a risk")
+    if not reason.strip() or len(reason) > MAX_ACCEPT_REASON_CHARS:
+        raise ModelError(f"a reason of 1-{MAX_ACCEPT_REASON_CHARS} characters is required")
+    matches = [f for f in packet.uncertaintyFlags if f.flagId == flagId]
+    if not matches:
+        raise ModelError(f"flag {flagId} not found")
+    if matches[0].isAccepted:
+        raise ModelError("flag already accepted")
+    accepted = matches[0].model_copy(update={"acceptedReason": reason.strip(), "acceptedBy": actor, "acceptedAt": utcNow()})
+    UncertaintyFlag.model_validate(accepted.model_dump())
+    return packet.model_validate({**packet.model_dump(), "uncertaintyFlags": [
+        accepted if f.flagId == flagId else f for f in packet.uncertaintyFlags]})

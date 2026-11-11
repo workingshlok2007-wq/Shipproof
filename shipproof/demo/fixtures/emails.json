@@ -1,0 +1,5 @@
+[
+  {"id": "demo-msg-1", "internalDate": "1762941600000", "from": "Demo Hack Organisers <organisers@demo.event>",
+   "subject": "Reminder: repository visibility", "messageId": "<reminder-1@demo.event>",
+   "body": "Hi teams, please make sure your repository is public before you submit. Judges will not log in to view anything."}
+]

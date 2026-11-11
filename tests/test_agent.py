@@ -8,7 +8,14 @@ from fastapi.testclient import TestClient
 from langchain_core.tools import StructuredTool
 from starlette.websockets import WebSocketDisconnect
 
-from shipproof.agent.graph import AuditDependencies, runAudit
+from shipproof.agent.graph import AuditDependencies, runAudit as runAuditOutcome
+
+
+def runAudit(project, packetId, deps, startedAt, resume=None):
+    """Test adapter: (packet, summary, proofChecks) for finished audits."""
+    outcome = runAuditOutcome(project, packetId, deps, startedAt, resume)
+    assert not outcome.paused, f"audit paused unexpectedly: {outcome.question}"
+    return outcome.packet, outcome.summary, outcome.proofChecks
 from shipproof.agent.project import LinkTarget, Project, computeConfusionIndex
 from shipproof.agent.reconcile import reconcileDeadlines
 from shipproof.agent.store import ProjectStore
@@ -89,8 +96,9 @@ def test_confusionIndexIsStructuralAndCapped():
 class RoutingLlm:
     """Answers by response schema title; records calls."""
 
-    def __init__(self, failOn=()):
+    def __init__(self, failOn=(), investigation=None, rulesBySource=None):
         self.failOn, self.calls = set(failOn), []
+        self.investigation = list(investigation or [])
 
     def generateJson(self, systemInstruction, userContent, responseSchema):
         title = responseSchema["title"]
@@ -107,6 +115,8 @@ class RoutingLlm:
                                              "readmeQuote": None, "codeEvidencePaths": ["audit.py"], "codeEvidenceSymbols": []}]})
         if title == "RawInterpretationCheck":
             return json.dumps({"verdict": "NO_MISREADING_FOUND", "conflicts": []})
+        if title == "RawInvestigation":
+            return json.dumps({"steps": self.investigation.pop(0) if self.investigation else []})
         raise AssertionError(title)
 
 
@@ -163,7 +173,7 @@ class TestGraph:
         assert summary.effectiveDeadline == D1 and not summary.halted
         assert {e.evidenceId for e in packet.evidence} == {"repoVisibility", "repoReadme", "repoLicense", "link1"}
         assert packet.reports[0].alignmentScore == 100
-        assert [t.tool for t in summary.plan] == ["auditRepository", "auditLink", "assessAlignment"]
+        assert [t.tool for t in summary.plan] == ["auditRepository", "auditLink", "assessAlignment", "investigate"]
         assert ["stage", "plan", "confusion"] <= list(dict.fromkeys(events))
         kinds = {f.kind for f in packet.uncertaintyFlags}
         assert kinds == {UncertaintyKind.MISSING_SOURCE_CATEGORY}  # inbox not checked

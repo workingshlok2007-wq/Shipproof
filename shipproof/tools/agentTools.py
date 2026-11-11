@@ -80,7 +80,7 @@ def buildTools(github: GitHubClient, linkAuditor: LinkAuditor, gmailService: Opt
             reason = f"status {page.finalStatus}; auth wall: {', '.join(page.authWallReasons) or 'none'}"
             return {"source": unreachableSource(url, SourceKind.EVENT_PAGE, reason).model_dump(mode="json"), "text": None}
         return {"source": sourceRecordFromPage(url, page.text).model_dump(mode="json"), "text": page.text,
-                "textTruncated": page.textTruncated}
+                "textTruncated": page.textTruncated, "links": list(page.links)}
 
     tools: list[BaseTool] = [
         StructuredTool.from_function(auditRepo, name="auditRepository", args_schema=RepoArgs,

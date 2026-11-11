@@ -1,0 +1,1 @@
+ShipProof Demo App will provide a live link auditor that checks every demo link as a logged-out judge, a deadline reconciliation engine that settles conflicting rule sources, and Slack notifications that alert the team when a check fails.

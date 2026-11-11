@@ -2,7 +2,9 @@
 
 Run:  uvicorn shipproof.api:buildApp --factory --host 127.0.0.1 --port 8000
 Env:  SHIPPROOF_API_TOKEN (required, >= 24 chars), SHIPPROOF_DATA_FILE, SHIPPROOF_CONFUSION_THRESHOLD,
-      SHIPPROOF_DASHBOARD_ORIGIN, GEMINI_API_KEY, GEMINI_MODEL, GITHUB_TOKEN, GMAIL_TOKEN_FILE, SHIPPROOF_CHROMIUM_PATH
+      SHIPPROOF_AUDIT_BUDGET_SECONDS (default 90), SHIPPROOF_LLM_MODE (live|record|replay), SHIPPROOF_LLM_CACHE,
+      SHIPPROOF_DEMO=1 (offline fixture site/repo/inbox), SHIPPROOF_DASHBOARD_ORIGIN, GEMINI_API_KEY, GEMINI_MODEL,
+      GITHUB_TOKEN, GITHUB_WRITE_TOKEN, GMAIL_TOKEN_FILE, SHIPPROOF_CHROMIUM_PATH
 """
 
 from __future__ import annotations
@@ -11,7 +13,8 @@ import asyncio
 import hmac
 import os
 import threading
-from contextlib import contextmanager
+import time
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator, Optional
@@ -22,13 +25,13 @@ from fastapi.responses import JSONResponse
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, ValidationError
 
-from shipproof.agent.graph import AuditDependencies, runAudit
+from shipproof.agent.graph import AuditDependencies, newCheckpointer, runAudit
 from shipproof.agent.project import LinkTarget, Project
 from shipproof.agent.store import ConflictError, EventBus, NotFoundError, ProjectStore, StoreError
 from shipproof.remediation import FileChange, RemediationKind, RemediationStatus, fillLicenseTemplate
 from shipproof.tools.githubAudit import GitHubError
 from shipproof.tools.githubWrite import GitHubWriter
-from shipproof.llm import GeminiClient, GeminiConfig, LlmClient, LlmConfigError
+from shipproof.llm import BudgetedLlm, LlmClient, LlmConfigError, LlmRuntime, ReplayLlm
 from shipproof.models import (
     Actor,
     ActorKind,
@@ -63,26 +66,44 @@ class Settings:
     dataFile: Optional[Path] = None
     confusionThreshold: int = 15
     dashboardOrigin: str = "http://localhost:3000"
+    budgetSeconds: int = 90
+    llmMode: str = "live"
+    llmCacheFile: Path = Path("shipproof-llm-cache.json")
+    demo: bool = False
 
     def __post_init__(self) -> None:
         if len(self.apiToken) < MIN_TOKEN_CHARS:
             raise ValueError(f"SHIPPROOF_API_TOKEN must be at least {MIN_TOKEN_CHARS} characters")
         if not 1 <= self.confusionThreshold <= 100:
             raise ValueError("SHIPPROOF_CONFUSION_THRESHOLD must be in [1, 100]")
+        if not 15 <= self.budgetSeconds <= 600:
+            raise ValueError("SHIPPROOF_AUDIT_BUDGET_SECONDS must be in [15, 600]")
+        if self.llmMode not in ("live", "record", "replay"):
+            raise ValueError("SHIPPROOF_LLM_MODE must be live, record or replay")
 
     @classmethod
     def fromEnvironment(cls) -> Settings:
         try:
             threshold = int(os.environ.get("SHIPPROOF_CONFUSION_THRESHOLD", "15"))
+            budget = int(os.environ.get("SHIPPROOF_AUDIT_BUDGET_SECONDS", "90"))
         except ValueError as error:
-            raise ValueError("SHIPPROOF_CONFUSION_THRESHOLD must be an integer") from error
+            raise ValueError("SHIPPROOF_CONFUSION_THRESHOLD and SHIPPROOF_AUDIT_BUDGET_SECONDS must be integers") from error
         dataFile = os.environ.get("SHIPPROOF_DATA_FILE", "shipproof-data.json")
         return cls(apiToken=os.environ.get("SHIPPROOF_API_TOKEN", ""), dataFile=Path(dataFile) if dataFile else None,
-                   confusionThreshold=threshold, dashboardOrigin=os.environ.get("SHIPPROOF_DASHBOARD_ORIGIN", "http://localhost:3000"))
+                   confusionThreshold=threshold, dashboardOrigin=os.environ.get("SHIPPROOF_DASHBOARD_ORIGIN", "http://localhost:3000"),
+                   budgetSeconds=budget, llmMode=os.environ.get("SHIPPROOF_LLM_MODE", "live"),
+                   llmCacheFile=Path(os.environ.get("SHIPPROOF_LLM_CACHE", "shipproof-llm-cache.json")),
+                   demo=os.environ.get("SHIPPROOF_DEMO") == "1")
 
 
-@contextmanager
-def defaultToolbox() -> Iterator[dict[str, BaseTool]]:
+def makeToolbox(demoBase: Optional[str] = None) -> ToolboxFactory:
+    @contextmanager
+    def toolbox() -> Iterator[dict[str, BaseTool]]:
+        yield from _toolbox(demoBase)
+    return toolbox
+
+
+def _toolbox(demoBase: Optional[str]) -> Iterator[dict[str, BaseTool]]:
     """Built inside the audit worker thread: Playwright's sync API is bound to the thread that started it."""
     from shipproof.tools.agentTools import buildTools
     from shipproof.tools.githubAudit import GitHubClient
@@ -97,10 +118,17 @@ def defaultToolbox() -> Iterator[dict[str, BaseTool]]:
             gmailService = None  # ingest records the inbox as NOT_CHECKED with the reason
     github = GitHubClient(token=os.environ.get("GITHUB_TOKEN") or None)
     try:
-        with LinkAuditor() as auditor:
-            yield {tool.name: tool for tool in buildTools(github, auditor, gmailService)}
+        with LinkAuditor(allowedOrigins=(demoBase,) if demoBase else ()) as auditor:
+            tools = {tool.name: tool for tool in buildTools(github, auditor, gmailService)}
+            if demoBase:
+                from shipproof.demo import demoTools
+                tools.update({tool.name: tool for tool in demoTools(demoBase, tools["auditRepository"])})
+            yield tools
     finally:
         github.close()
+
+
+defaultToolbox = makeToolbox()
 
 
 def defaultWriter() -> GitHubWriter:
@@ -109,13 +137,6 @@ def defaultWriter() -> GitHubWriter:
         raise GitHubError("GITHUB_WRITE_TOKEN is not set on the engine; applying fixes needs a token with Contents and "
                           "Pull requests write access to this repository")
     return GitHubWriter(token)
-
-
-def defaultLlm() -> tuple[Optional[LlmClient], Optional[str]]:
-    try:
-        return GeminiClient(GeminiConfig.fromEnvironment()), None
-    except LlmConfigError as error:
-        return None, str(error)
 
 
 # ---------------------------------------------------------------- request bodies
@@ -164,17 +185,73 @@ def _validationDetail(error: ValidationError) -> list[dict[str, Any]]:
     return [{"loc": [str(p) for p in e["loc"]], "msg": e["msg"]} for e in error.errors(include_url=False)]
 
 
+class AnswerBody(BaseModel):
+    questionId: str = Field(max_length=64)
+    value: str = Field(min_length=1, max_length=64)
+
+
+class AcceptBody(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class ApplyBody(BaseModel):
     licenseKey: Optional[str] = None
     copyrightHolder: Optional[str] = Field(None, max_length=100)
 
 
-def createApp(settings: Settings, toolboxFactory: ToolboxFactory = defaultToolbox, llmFactory: LlmFactory = defaultLlm,
+def createApp(settings: Settings, toolboxFactory: Optional[ToolboxFactory] = None, llmFactory: Optional[LlmFactory] = None,
               writerFactory: WriterFactory = defaultWriter) -> FastAPI:
+    """toolboxFactory/llmFactory default to the real tools and the startup-resolved Gemini model (tests inject fakes)."""
     store = ProjectStore(settings.dataFile)
     bus = EventBus()
-    app = FastAPI(title="ShipProof", version="0.4.0")
-    app.state.store, app.state.bus = store, bus
+    runtime = LlmRuntime()
+    checkpointer = newCheckpointer()
+    demoState: dict[str, Any] = {}
+
+    def runtimeLlm() -> tuple[Optional[LlmClient], Optional[str]]:
+        if settings.llmMode == "replay":
+            return ReplayLlm(settings.llmCacheFile, "replay"), None
+        if runtime.client is None:
+            return None, f"model {runtime.status}: {runtime.reason or 'still resolving'}"
+        if settings.llmMode == "record":
+            return ReplayLlm(settings.llmCacheFile, "record", runtime.client), None
+        return runtime.client, None
+
+    resolveLlm: LlmFactory = llmFactory or runtimeLlm
+
+    def modelLabel(llm: Optional[LlmClient]) -> Optional[str]:
+        if llm is None:
+            return None
+        if isinstance(llm, ReplayLlm):
+            return f"{llm.mode}" + (f" via {runtime.model}" if llm.mode == "record" and runtime.model else " (saved answers)")
+        config = getattr(llm, "config", None)
+        return getattr(config, "model", None) or type(llm).__name__
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):  # type: ignore[no-untyped-def]
+        if llmFactory is None and settings.llmMode != "replay":
+            threading.Thread(target=runtime.resolve, name="llm-resolve", daemon=True).start()
+        if settings.demo:
+            from shipproof.demo import DEMO_PROJECT_ID, DemoSiteServer, demoPort, demoProject
+            server = DemoSiteServer(demoPort())
+            demoState["server"], demoState["base"] = server, server.base
+            try:
+                store.getProject(DEMO_PROJECT_ID)
+            except NotFoundError:
+                store.createProject(demoProject(server.base))
+        try:
+            yield
+        finally:
+            if "server" in demoState:
+                demoState["server"].close()
+
+    def currentToolbox() -> ContextManager[dict[str, BaseTool]]:
+        if toolboxFactory is not None:
+            return toolboxFactory()
+        return makeToolbox(demoState.get("base"))()
+
+    app = FastAPI(title="ShipProof", version="0.6.0", lifespan=lifespan)
+    app.state.store, app.state.bus, app.state.runtime = store, bus, runtime
     app.add_middleware(CORSMiddleware, allow_origins=[settings.dashboardOrigin], allow_methods=["GET", "POST"],
                        allow_headers=["Authorization", "Content-Type"])
 
@@ -210,8 +287,10 @@ def createApp(settings: Settings, toolboxFactory: ToolboxFactory = defaultToolbo
     # ---------------------------------------------------------------- projects
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, Any]:
+        llm = {"status": "injected"} if llmFactory is not None else runtime.snapshot()
+        return {"status": "ok", "llm": llm, "llmMode": settings.llmMode, "demo": settings.demo,
+                "budgetSeconds": settings.budgetSeconds}
 
     @app.post("/projects", status_code=201)
     def createProject(body: ProjectBody, _: Actor = Depends(requireHuman)) -> dict[str, Any]:
@@ -280,32 +359,60 @@ def createApp(settings: Settings, toolboxFactory: ToolboxFactory = defaultToolbo
 
     # ---------------------------------------------------------------- audit
 
-    @app.post("/projects/{projectId}/trigger-audit", status_code=202)
-    def triggerAudit(projectId: str, _: Actor = Depends(requireHuman)) -> dict[str, str]:
-        project, packetId = store.beginAudit(projectId)
-        startedAt = utcNow()
-
+    def launch(project: Project, packetId: str, startedAt: Any, resume: Optional[dict[str, Any]] = None) -> None:
         def emit(kind: str, data: dict[str, Any]) -> None:
             bus.publish(packetId, kind, data)
 
         def worker() -> None:
             try:
-                llm, llmReason = llmFactory()
-                with toolboxFactory() as tools:
-                    deps = AuditDependencies(tools=tools, llm=llm, llmUnavailableReason=llmReason,
-                                             confusionThreshold=settings.confusionThreshold, emit=emit)
-                    packet, summary, checks = runAudit(project, packetId, deps, startedAt)
-                store.completeAudit(projectId, packet, summary, checks, project.proofChecks)
-                emit("done", {"approvalState": packet.approvalState.value, "confusionIndex": summary.confusionIndex,
-                              "halted": summary.halted})
+                llm, llmReason = resolveLlm()
+                deadline = time.monotonic() + settings.budgetSeconds  # a fresh budget per run; time waiting for you is free
+                label = modelLabel(llm)
+                with currentToolbox() as tools:
+                    deps = AuditDependencies(
+                        tools=tools, llm=BudgetedLlm(llm, deadline) if llm is not None else None, llmUnavailableReason=llmReason,
+                        confusionThreshold=settings.confusionThreshold, emit=emit, budgetSeconds=settings.budgetSeconds,
+                        deadline=deadline, previousPacket=store.previousPacket(project.projectId, packetId),
+                        checkpointer=checkpointer, llmModel=label)
+                    outcome = runAudit(project, packetId, deps, startedAt, resume)
+                if outcome.paused:
+                    store.pauseAudit(packetId, outcome.summary)
+                    emit("paused", {"questionId": outcome.question.questionId if outcome.question else None})
+                    return
+                assert outcome.packet is not None
+                store.completeAudit(project.projectId, outcome.packet, outcome.summary, outcome.proofChecks,
+                                    outcome.startProject.proofChecks, outcome.decisions)
+                emit("done", {"approvalState": outcome.packet.approvalState.value, "confusionIndex": outcome.summary.confusionIndex,
+                              "halted": outcome.summary.halted})
             except Exception as error:  # every failure ends at the human boundary with a CRITICAL flag
-                failed = store.failAudit(projectId, packetId, f"{type(error).__name__}: {error}")
+                failed = store.failAudit(project.projectId, packetId, f"{type(error).__name__}: {error}")
                 emit("error", {"message": f"{type(error).__name__}: {error}"[:500]})
                 emit("done", {"approvalState": failed.approvalState.value})
 
-        emit("stage", {"stage": "queued"})
         threading.Thread(target=worker, name=f"audit-{packetId}", daemon=True).start()
+
+    @app.post("/projects/{projectId}/trigger-audit", status_code=202)
+    def triggerAudit(projectId: str, _: Actor = Depends(requireHuman)) -> dict[str, str]:
+        project, packetId = store.beginAudit(projectId)
+        bus.publish(packetId, "stage", {"stage": "queued"})
+        launch(project, packetId, utcNow())
         return {"packetId": packetId}
+
+    @app.post("/packets/{packetId}/answers", status_code=202)
+    def answerQuestion(packetId: str, body: AnswerBody, actor: Actor = Depends(requireHuman)) -> dict[str, str]:
+        """A human answer resumes the paused audit from where it stopped."""
+        summary = store.resumeAudit(packetId, body.questionId, body.value, actor)
+        bus.publish(packetId, "answer", {"questionId": body.questionId, "value": body.value})
+        launch(store.getProject(summary.projectId), packetId, summary.startedAt,
+               resume={"value": body.value, "actor": actor.model_dump(mode="json")})
+        return {"packetId": packetId, "status": "resumed"}
+
+    @app.post("/packets/{packetId}/flags/{flagId}/accept")
+    def acceptRisk(packetId: str, flagId: str, body: AcceptBody, actor: Actor = Depends(requireHuman)) -> dict[str, Any]:
+        """Explicit, recorded acceptance of one risk; remembered for later audits of the same project."""
+        packet = store.acceptRisk(packetId, flagId, actor, body.reason)
+        bus.publish(packetId, "riskAccepted", {"flagId": flagId})
+        return packet.model_dump(mode="json")
 
     @app.get("/packets/{packetId}")
     def getPacket(packetId: str, _: Actor = Depends(requireHuman)) -> dict[str, Any]:

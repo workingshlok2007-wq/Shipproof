@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 from langchain_core.tools import StructuredTool
 from pydantic import ValidationError
 
-from shipproof.agent.graph import runAudit
 from shipproof.api import Settings, createApp
 from shipproof.models import CheckStatus, EvidenceItem, EvidenceMethod, utcNow
 from shipproof.prompts import CodeIndex, CodeIndexEntry, FeatureAssessment
@@ -24,7 +23,7 @@ from shipproof.remediation import (
 )
 from shipproof.tools.githubAudit import GitHubError
 from shipproof.tools.githubWrite import GitHubWriter
-from tests.test_agent import AUTH, TOKEN, RoutingLlm, deps, fakeTools, makeProject, repoAuditPayload, waitForPending
+from tests.test_agent import AUTH, TOKEN, RoutingLlm, deps, fakeTools, makeProject, repoAuditPayload, runAudit, waitForPending
 
 INDEX = CodeIndex(entries=(
     CodeIndexEntry(path="requirements.txt"),
